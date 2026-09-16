@@ -1,64 +1,78 @@
 /* ============================================================
-   Music Together — P2P Real-time Sync Engine
+   Music Together — P2P via MQTT signaling + WebRTC
+   Tanpa VPS. Sinyal: broker MQTT publik (EMQX / fallback HiveMQ).
+   Audio: WebRTC peer-to-peer (DJ → setiap pendengar).
    ============================================================ */
 
 (() => {
     'use strict';
 
     // ─── CONFIG ────────────────────────────────────────────
+    const BROKERS = [
+        'wss://broker.emqx.io:8084/mqtt',
+        'wss://broker.hivemq.com:8884/mqtt',
+    ];
     const SYNC_INTERVAL_MS = 500;
-    const SYNC_THRESHOLD_S = 0.25;
+    const BEAT_DJ_MS       = 4000;   // DJ heartbeat
+    const BEAT_GUEST_MS    = 9000;   // guest heartbeat
+    const GUEST_TIMEOUT_MS = 24000;  // DJ anggap guest keluar setelah ini
+    const DJ_TIMEOUT_MS    = 15000;  // guest anggap DJ offline setelah ini
     const MAX_FILE_MB      = 50;
-    const ROOM_PREFIX      = 'mt-';
     const CODE_CHARS       = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    const JOIN_MAX_ATTEMPTS = 4;
-    const JOIN_TIMEOUT_MS   = 9000;
-    const JOIN_RETRY_BASE_MS= 1200;
 
-    // Multi-STUN: memperbesar peluang koneksi P2P tembus NAT.
-    const PEER_OPTS = {
-        debug: 0,
-        config: {
-            iceServers: [
-                { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-                { urls: 'stun:global.stun.twilio.com:3478' },
-                { urls: 'stun:stun.cloudflare.com:3478' },
-            ]
-        }
+    const RTC_OPTS = {
+        iceServers: [
+            { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+            { urls: 'stun:global.stun.twilio.com:3478' },
+            { urls: 'stun:stun.cloudflare.com:3478' },
+        ]
     };
 
     // ─── STATE ─────────────────────────────────────────────
     const S = {
         isDJ:     false,
         roomCode: '',
-        peer:     null,
-        conns:    [],          // DJ→listener data channels
-        calls:    new Map(),   // peerId → MediaConnection (active audio calls)
+        mq:       null,          // mqtt client
+        topic:    '',
+
+        // DJ
+        djStream: null,
+        djTrack:  null,
+        djCtx:    null,
+        pcs:      new Map(),     // guestId → RTCPeerConnection
+        guests:   new Map(),     // guestId → {name, lastSeen}
+        beatT:    null,
+        syncT:    null,
+
+        // Guest
+        guestId:  'g-' + Math.random().toString(36).slice(2, 8),
+        others:   new Map(),  // guest-side roster (id → name), exclude self
+        pc:       null,
+        gotStream:false,
+        announced:false,
+        djAlive:  0,            // last time DJ seen (ms)
+        beatGT:   null,
+        pubT:     null,   // DJ broadcast state periodik
+
         audio:    null,
-        audioStream: null,     // DJ's captured MediaStream
-        audioCtx: null,
-        queue:    [],          // [{name, url, size, file, duration}]
+        queue:    [],   // [{name, url, size, dur}]
         songIdx:  -1,
         playing:  false,
-        listeners: new Map(),  // peerId → {name, color}
-        syncTimer: null,
         duration: 0,
-        joinBusy:  false,      // joiner sedang mencoba koneksi
-        joinAttempt: 0,
-        joinTimer:   null,
-        syncReqCount: 0,  // jumlah permintaan ulang stream saat join
+
+        joinBusy: false,
     };
 
-    // ─── DOM HELPERS ──────────────────────────────────────
+    // ─── DOM ───────────────────────────────────────────────
     const $ = (s) => document.querySelector(s);
-    const audio = () => S.audio;
 
-    // ─── UTILITIES ────────────────────────────────────────
+    // ─── UTILITIES ─────────────────────────────────────────
     function genCode() {
         let c = '';
         for (let i = 0; i < 6; i++) c += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
         return c;
     }
+    function esc(t) { const d = document.createElement('span'); d.textContent = t; return d.innerHTML; }
     function fmtTime(s) {
         if (!s || isNaN(s)) return '0:00';
         const m = Math.floor(s / 60), sec = Math.floor(s % 60);
@@ -69,7 +83,6 @@
         if (b < 1048576) return (b / 1024).toFixed(0) + ' KB';
         return (b / 1048576).toFixed(1) + ' MB';
     }
-    function esc(t) { const d = document.createElement('span'); d.textContent = t; return d.innerHTML; }
     function rndColor() {
         const c = ['#e91e63','#9c27b0','#673ab7','#3f51b5','#2196f3','#00bcd4','#009688','#4caf50','#ff9800','#ff5722'];
         return c[Math.floor(Math.random() * c.length)];
@@ -83,290 +96,291 @@
         setTimeout(() => el.classList.add('out'), 3000);
         setTimeout(() => el.remove(), 3300);
     }
-    function broadcast(data) {
-        S.conns.forEach(c => { try { c.send(data); } catch (_) {} });
+    function dec(payload) {
+        if (typeof payload === 'string') return JSON.parse(payload);
+        if (payload instanceof ArrayBuffer) payload = new Uint8Array(payload);
+        return JSON.parse(new TextDecoder().decode(payload));
     }
-
-    // ─── ROOM ──────────────────────────────────────────────
     function setJoinStatus(msg, cls) {
         const el = $('#join-status');
         if (!el) return;
-        el.textContent = msg;
-        el.className = cls ? 'join-status ' + cls : 'join-status';
+        el.textContent = msg || '';
+        el.className = 'join-status' + (cls ? ' ' + cls : '');
     }
 
-    function destroyPeer() {
-        if (S.peer) { try { S.peer.destroy(); } catch (_) {} S.peer = null; }
+    // ─── MQTT (broker manager) ─────────────────────────────
+    function connectBroker(onReady, onMsg) {
+        const guarded = (d) => { if (d && d.src === selfSrc()) return; onMsg(d); };
+        let idx = 0;
+        function tryNext() {
+            const url = BROKERS[idx];
+            setJoinStatus('Menghubungkan server… ' + (idx + 1) + '/' + BROKERS.length, 'connecting');
+            const client = mqtt.connect(url, {
+                clientId:   S.isDJ ? 'dj-' + Math.random().toString(36).slice(2, 10)
+                                   : 'g-' + Math.random().toString(36).slice(2, 10),
+                clean:      true,
+                reconnectPeriod: 1000,
+                connectTimeout: 8000,
+            });
+            client.on('connect', () => {
+                S.mq = client;
+                client.subscribe(S.topic, { qos: 0 });
+                onReady();
+            });
+            client.on('message', (t, p) => { try { guarded(dec(p)); } catch (e) {} });
+            client.on('offline', () => { /* auto-reconnect */ });
+            client.on('close', () => {
+                if (!S.mq && idx < BROKERS.length - 1) {
+                    idx++;
+                    setTimeout(tryNext, 500);
+                }
+            });
+            client.on('error', () => { /* handled via close/offline */ });
+        }
+        tryNext();
+    }
+    function pub(obj) {
+        if (!S.mq) return;
+        obj.src = S.isDJ ? 'dj' : S.guestId;   // self-echo filter
+        S.mq.publish(S.topic, JSON.stringify(obj));
+    }
+    function selfSrc() { return S.isDJ ? 'dj' : S.guestId; }
+
+    // ─── STREAM AUDIO DJ ───────────────────────────────────
+    function ensureStream() {
+        if (S.djStream) return;
+        try {
+            if (!S.djCtx) S.djCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const src = S.djCtx.createMediaElementSource(S.audio);
+            const dest = S.djCtx.createMediaStreamDestination();
+            src.connect(dest);
+            src.connect(S.djCtx.destination);   // DJ dengar lagu
+            S.djStream = dest.stream;
+            S.djTrack = dest.stream.getAudioTracks()[0];
+        } catch (e) {
+            console.error('ensureStream error', e);
+        }
     }
 
+    // ─── WEBRTC ────────────────────────────────────────────
+    // DJ side: answer guest's recvonly offer, attach djTrack
+    async function answerGuest(guestId, offerSdp) {
+        closePc(guestId);
+        const pc = new RTCPeerConnection(RTC_OPTS);
+        S.pcs.set(guestId, pc);
+        if (S.djTrack) pc.addTrack(S.djTrack, S.djStream);
+        pc.onicecandidate = (e) => { if (e.candidate) pub({ type: 'ice', to: guestId, candidate: e.candidate }); };
+        pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                closePc(guestId);
+            }
+        };
+        try {
+            await pc.setRemoteDescription(offerSdp);
+            const ans = await pc.createAnswer();
+            await pc.setLocalDescription(ans);
+            pub({ type: 'answer', to: guestId, sdp: pc.localDescription });
+        } catch (e) {
+            console.error('answerGuest error', e);
+            closePc(guestId);
+        }
+    }
+    function closePc(guestId) {
+        const pc = S.pcs.get(guestId);
+        if (pc) { try { pc.close(); } catch (_) {} S.pcs.delete(guestId); }
+    }
+    function addIce(guestId, cand) {
+        const pc = S.pcs.get(guestId);
+        if (pc && cand) { try { pc.addIceCandidate(cand); } catch (e) {} }
+    }
+
+    // Guest side: recvonly audio, trickle ICE, apply answer
+    async function guestOffer() {
+        if (S.isDJ || S.pc) return;
+        const pc = new RTCPeerConnection(RTC_OPTS);
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+        pc.onicecandidate = (e) => { if (e.candidate) pub({ type: 'ice', id: S.guestId, candidate: e.candidate }); };
+        pc.ontrack = (ev) => {
+            S.gotStream = true;
+            S.audio.srcObject = ev.streams[0] || ev.stream;
+            S.audio.play().catch(() => {});
+        };
+        pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'connected') {
+                setJoinStatus('');
+                if (!S.announced) { S.announced = true; toast('Berhasil gabung!'); }
+            }
+            if (pc.connectionState === 'failed') {
+                closeGuestPc();
+                S.gotStream = false;
+                toast('Koneksi audio bermasalah — mencoba ulang…');
+            }
+        };
+        S.pc = pc;
+        try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            pub({ type: 'offer', id: S.guestId, sdp: pc.localDescription });
+        } catch (e) {
+            console.error('guestOffer error', e);
+            closeGuestPc();
+        }
+    }
+    function closeGuestPc() {
+        if (S.pc) { try { S.pc.close(); } catch (_) {} S.pc = null; }
+        S.gotStream = false;
+    }
+
+    // ─── ROOM — DJ ─────────────────────────────────────────
     function createRoom() {
         if (S.joinBusy) return;
-        setJoinStatus('');
-        destroyPeer();
-        const code = genCode();
-        const peer = new Peer(ROOM_PREFIX + code, PEER_OPTS);
+        S.isDJ = true;
+        S.roomCode = genCode();
+        S.topic = 'mtm/' + S.roomCode;
+        S.joinBusy = true;
+        setJoinStatus('Membuat ruangan…', 'connecting');
+        destroyBroker();
+        // AudioContext dibikin dalam gesture klik → tidak diblokir autoplay policy
+        try { if (!S.djCtx) S.djCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {}
 
-        peer.on('open', () => {
-            S.isDJ = true;
-            S.roomCode = code;
-            S.peer = peer;
+        connectBroker(() => {
+            S.joinBusy = false;
+            setJoinStatus('');
+            ensureStream();
             showRoom();
-            toast('Ruangan dibuat — kode: ' + code);
-        });
+            toast('Ruangan dibuat — kode: ' + S.roomCode);
 
-        peer.on('connection', onIncomingConn);
-        peer.on('error', (err) => {
-            console.error('DJ peer error:', err);
-            if (err.type === 'unavailable-id') {
-                peer.destroy();
-                setTimeout(createRoom, 200);
-                return;
+            // Heartbeat DJ + roster sweep
+            S.beatT = setInterval(() => {
+                pub({ type: 'beat' });
+                const now = Date.now();
+                S.guests.forEach((g, id) => {
+                    if (now - g.lastSeen > GUEST_TIMEOUT_MS) {
+                        S.guests.delete(id);
+                        closePc(id);
+                        pub({ type: 'l', id, name: g.name });
+                        updateListenersL();
+                    }
+                });
+            }, BEAT_DJ_MS);
+
+            // Broadcast state periodik (refresh utk yg telat gabung / resync)
+            S.pubT = setInterval(() => { pubState(); }, 5000);
+        }, onDjMsg);
+    }
+
+    function onDjMsg(d) {
+        switch (d.type) {
+            case 'hello': {
+                S.guests.set(d.id, { name: d.name, lastSeen: Date.now() });
+                updateListenersL();
+                pub({ type: 'j', id: d.id, name: d.name });
+                pubState();
+                break;
             }
-            toast('Error: ' + err.type);
-        });
-        peer.on('disconnected', () => {
-            toast('⚠ Sinyal terputus — mencoba reconnect…');
-        });
-        peer.on('reconnected', () => {
-            toast('Sinyal kembali normal.');
-        });
-        peer.on('close', () => {
-            toast('Koneksi ke server sinyal hilang');
-            goHome();
+            case 'offer':
+                S.guests.set(d.id, { name: S.guests.get(d.id)?.name || d.name || 'Pengguna', lastSeen: Date.now() });
+                answerGuest(d.id, d.sdp);
+                break;
+            case 'ice':
+                addIce(d.id, d.candidate);
+                break;
+            case 'beatG': {
+                const g = S.guests.get(d.id);
+                if (g) { g.lastSeen = Date.now(); }
+                else {
+                    S.guests.set(d.id, { name: d.name, lastSeen: Date.now() });
+                    pub({ type: 'j', id: d.id, name: d.name });
+                    updateListenersL();
+                }
+                break;
+            }
+            case 'reqstate': pubState(); break;
+            case 'bye': {
+                S.guests.delete(d.id);
+                closePc(d.id);
+                pub({ type: 'l', id: d.id, name: d.name });
+                updateListenersL();
+                break;
+            }
+        }
+    }
+
+    function pubState() {
+        pub({
+            type: 'state',
+            queue: S.queue.map(q => ({ name: q.name, size: q.size, dur: q.dur })),
+            song: S.songIdx,
+            playing: S.playing,
+            time: S.audio ? S.audio.currentTime : 0,
+            dur: S.duration,
+            dj: true,
+            guests: Array.from(S.guests).map(([id, g]) => ({ id, name: g.name })),
         });
     }
 
-    // ── Listener join (with retry) ──────────────────────
+    // ─── ROOM — GUEST ──────────────────────────────────────
     function joinRoom(code) {
         if (S.joinBusy) return;
         if (!code || code.length < 4) { toast('Masukkan kode ruangan yang valid'); return; }
-        destroyPeer();
+        S.isDJ = false;
+        S.roomCode = code.toUpperCase();
+        S.topic = 'mtm/' + S.roomCode;
         S.joinBusy = true;
-        S.joinAttempt = 0;
-        setJoinStatus('Mencari ruangan…', 'connecting');
+        destroyBroker();
         $('#btn-join').disabled = true;
         $('#btn-create').disabled = true;
 
-        function attempt() {
-            S.joinAttempt++;
-            const target = ROOM_PREFIX + code.toUpperCase();
-            const peer = new Peer(undefined, PEER_OPTS);
+        connectBroker(() => {
+            // Hello + offer; re-offer sampai dapat answer
+            pub({ type: 'hello', id: S.guestId, name: 'Pengguna' });
+            setTimeout(() => guestOffer(), 300);
+            const retryOffer = setInterval(() => {
+                if (!S.gotStream) guestOffer();
+            }, 6000);
+            S.beatGT = setInterval(() => {
+                pub({ type: 'beatG', id: S.guestId, name: 'Pengguna' });
+            }, BEAT_GUEST_MS);
 
-            // Receive DJ's audio stream — set up BEFORE connect attempt
-            peer.on('call', (call) => {
-                call.answer();
-                call.on('stream', (remoteStream) => {
-                    S.syncReqCount = 0;
-                    S.audio.srcObject = remoteStream;
-                    S.audio.play().catch(() => {});
-                });
-                call.on('error', (e) => console.error('call err', e));
-            });
-
-            peer.on('open', () => {
-                setJoinStatus('Bergabung… (percobaan ' + S.joinAttempt + ')', 'connecting');
-                const conn = peer.connect(target, { reliable: true });
-
-                const timer = setTimeout(() => {
-                    // Timed out — destroy and retry
-                    try { conn.close(); } catch (_) {}
-                    peer.destroy();
-                    retry();
-                }, JOIN_TIMEOUT_MS);
-
-                conn.on('open', () => {
-                    clearTimeout(timer);
-                    S.isDJ = false;
-                    S.roomCode = code.toUpperCase();
-                    S.peer = peer;
-                    S.conns = [conn];
-                    S.joinBusy = false;
-                    $('#btn-join').disabled = false;
-                    $('#btn-create').disabled = false;
-                    setJoinStatus('');
-                    showRoom();
-                    toast('Berhasil gabung!');
-                });
-
-                conn.on('data', (d) => handleMsg(d, conn));
-                conn.on('close', () => {
-                    clearTimeout(timer);
-                    toast('Koneksi terputus — sedang reconnect…');
-                    S.joinBusy = true;
-                    S.joinAttempt = 0;
-                    peer.destroy();
-                    retry();
-                });
-                conn.on('error', (e) => {
-                    clearTimeout(timer);
-                    console.error('conn error', e);
-                    S.joinBusy = true;
-                    S.joinAttempt = 0;
-                    peer.destroy();
-                    retry();
-                });
-            });
-
-            peer.on('error', (err) => {
-                console.error('join peer error:', err.type);
-                peer.destroy();
-                if (err.type === 'peer-unavailable') {
-                    // Room truly not found — don't retry forever
-                    if (S.joinAttempt >= 2) {
-                        finishJoin('Ruangan tidak ditemukan. Pastikan DJ masih buka halaman.', 'error');
-                        return;
-                    }
+            // DJ presence watchdog
+            setInterval(() => {
+                const check = Date.now() - S.djAlive;
+                if (check > DJ_TIMEOUT_MS) {
+                    setJoinStatus('Menunggu DJ online…', 'retrying');
                 }
-                retry();
-            });
-        }
+            }, 3000);
 
-        function retry() {
-            if (S.joinAttempt >= JOIN_MAX_ATTEMPTS || !S.joinBusy) {
-                finishJoin(S.joinBusy ? 'Gagal terhubung.' : '', 'error');
-                return;
-            }
-            const delay = JOIN_RETRY_BASE_MS * S.joinAttempt;
-            setJoinStatus('Mencoba ulang dalam ' + Math.round(delay / 1000) + 's…', 'retrying');
-            S.joinTimer = setTimeout(attempt, delay);
-        }
+            // Stop refresh loops when room closes
+            S._stopGuestLoops = () => {
+                clearInterval(retryOffer);
+                clearInterval(S.beatGT);
+            };
+        }, onGuestMsg);
 
-        function finishJoin(msg, cls) {
-            S.joinBusy = false;
-            $('#btn-join').disabled = false;
-            $('#btn-create').disabled = false;
-            setJoinStatus(msg, cls);
-            if (msg) toast(msg);
-            // If we were in room (reconnecting), go back home on final failure
-            if (cls === 'error' && $('#room').classList.contains('active')) goHome();
-        }
-
-        attempt();
+        // watchdog untuk broker connect timeout
+        setTimeout(() => {
+            if (S.joinBusy && !S.roomShown) setJoinStatus('Menunggu DJ online…', 'retrying');
+        }, 6000);
     }
 
-    function leaveRoom() {
-        if (S.syncTimer) { clearInterval(S.syncTimer); S.syncTimer = null; }
-        if (S.joinTimer) { clearTimeout(S.joinTimer); S.joinTimer = null; }
-        S.joinBusy = false;
-        destroyPeer();
-        S.conns = [];
-        S.listeners.clear();
-        S.queue.forEach(s => { if (s.url) URL.revokeObjectURL(s.url); });
-        S.queue = [];
-        S.songIdx = -1;
-        S.playing = false;
-        S.audioStream = null;
-        if (S.audioCtx) { S.audioCtx.close(); S.audioCtx = null; }
-        goHome();
-    }
-
-    // ─── DJ: INCOMING CONNECTION ───────────────────────────
-    function onIncomingConn(conn) {
-        conn.on('open', () => {
-            S.conns.push(conn);
-
-            const name = 'Pengguna ' + (1000 + Math.floor(Math.random() * 9000));
-            S.listeners.set(conn.peer, { name, color: rndColor() });
-
-            // Send full state to new listener
-            conn.send({
-                type: 'welcome',
-                queue:   S.queue.map(s => ({ name: s.name, size: s.size, dur: s.duration })),
-                songIdx: S.songIdx,
-                playing: S.playing,
-                time:    S.audio ? S.audio.currentTime : 0,
-            });
-
-            // Send audio stream
-            sendStreamTo(conn);
-
-            updateListeners();
-            broadcast({ type: 'listener-join', name });
-            toast(name + ' bergabung');
-        });
-
-        conn.on('data', (d) => handleMsg(d, conn));
-        conn.on('close', () => {
-            const info = S.listeners.get(conn.peer);
-            S.conns = S.conns.filter(c => c.peer !== conn.peer);
-            S.listeners.delete(conn.peer);
-            updateListeners();
-            if (info) { toast(info.name + ' keluar'); broadcast({ type: 'listener-leave', name: info.name }); }
-        });
-    }
-
-    // ─── MESSAGE HANDLER ───────────────────────────────────
-    function handleMsg(d, conn) {
+    function onGuestMsg(d) {
+        S.djAlive = Date.now();
         switch (d.type) {
-
-            /* ── DJ receives ── */
-            case 'request-sync': {
-                if (!S.isDJ) break;
-                conn.send({
-                    type: 'welcome',
-                    queue:   S.queue.map(s => ({ name: s.name, size: s.size, dur: s.duration })),
-                    songIdx: S.songIdx,
-                    playing: S.playing,
-                    time:    S.audio ? S.audio.currentTime : 0,
-                });
-                sendStreamTo(conn);
-                break;
-            }
-
-            /* ── Listener receives ── */
-            case 'welcome': {
-                if (S.isDJ) break;
-                S.queue = (d.queue || []).map(q => ({ name: q.name, size: q.size, duration: q.dur, url: '' }));
-                S.songIdx = d.songIdx ?? -1;
-                if (S.songIdx >= 0 && S.queue[S.songIdx]?.duration) {
-                    S.duration = S.queue[S.songIdx].duration;
-                }
+            case 'beat': S.djAlive = Date.now(); break;
+            case 'state': {
+                S.queue = (d.queue || []).map(q => ({ name: q.name, size: q.size, dur: q.dur, url: '' }));
+                S.duration = d.dur || 0;
+                S.songIdx = d.song ?? -1;
+                S.others = new Map((d.guests || []).filter(g => g.id !== S.guestId).map(g => [g.id, g.name]));
                 updateQueue();
+                updateListenersL();
                 if (S.songIdx >= 0 && S.queue[S.songIdx]) updateTrack(S.queue[S.songIdx].name);
-
-                // Robustness: request audio stream if none arrived shortly after joining
-                if (d.songIdx >= 0 && S.syncReqCount < 3) {
-                    S.syncReqCount++;
-                    setTimeout(() => {
-                        if (!S.audio.srcObject && S.peer && S.peer.connected) {
-                            try { S.conns.forEach(c => c.send({ type: 'request-sync' })); } catch (_) {}
-                        }
-                    }, 2500);
-                }
+                if (d.playing && !S.gotStream && !S.pc) setTimeout(() => guestOffer(), 400);
+                showRoom();
+                S.roomShown = true;
                 break;
             }
-
-            case 'sync': {
-                if (S.isDJ || !S.audio) break;
-                const latency = (Date.now() - d.ts) / 1000;
-                const target  = d.time + latency;
-                /* Live MediaStream is inherently in sync (same stream via WebRTC,
-                   jitter buffer only ~50-100ms). Seeking a stream would glitch it.
-                   Only correct position when playing a local/blob file. */
-                const isStream = !!S.audio.srcObject;
-                if (!isStream && Math.abs(S.audio.currentTime - target) > SYNC_THRESHOLD_S) {
-                    S.audio.currentTime = target;
-                }
-                if (d.playing && S.audio.paused)  S.audio.play().catch(() => {});
-                if (!d.playing && !S.audio.paused) S.audio.pause();
-                setPlayBtn(d.playing);
-                if (S.duration && isFinite(S.duration)) updateProgress(target, S.duration);
-                break;
-            }
-
-            case 'play':  { if (!S.isDJ && S.audio) { S.audio.play().catch(() => {}); setPlayBtn(true);  } break; }
-            case 'pause': { if (!S.isDJ && S.audio) { S.audio.pause();                  setPlayBtn(false); } break; }
-
-            case 'seek': {
-                if (!S.isDJ && S.audio && d.time != null && !S.audio.srcObject) {
-                    S.audio.currentTime = d.time;
-                    updateProgress(d.time, S.audio.duration || 0);
-                }
-                break;
-            }
-
-            case 'song-change': {
-                if (S.isDJ) break;
+            case 'song':
                 S.songIdx = d.idx;
                 if (S.queue[d.idx]) S.queue[d.idx].url = d.url || '';
                 if (d.dur) S.duration = d.dur;
@@ -374,168 +388,177 @@
                 updateQueue();
                 setPlayBtn(true);
                 break;
-            }
-
-            case 'queue-add': {
-                if (S.isDJ) break;
-                if (!S.queue.find(q => q.name === d.name)) {
-                    S.queue.push({ name: d.name, size: d.size, duration: d.dur, url: '' });
-                    updateQueue();
-                }
+            case 'qadd':
+                if (!S.queue.find(q => q.name === d.name)) { S.queue.push({ name: d.name, size: d.size, dur: d.dur, url: '' }); updateQueue(); }
                 break;
-            }
-
-            case 'queue-remove': {
-                if (S.isDJ) break;
+            case 'qrm':
                 if (S.queue[d.idx]) { S.queue.splice(d.idx, 1); if (d.idx <= S.songIdx) S.songIdx--; updateQueue(); }
                 break;
+            case 'play':  if (S.audio) { S.audio.play().catch(() => {}); setPlayBtn(true); } break;
+            case 'pause': if (S.audio) { S.audio.pause(); setPlayBtn(false); } break;
+            case 'seek':  if (S.audio && !S.audio.srcObject && d.time != null) { S.audio.currentTime = d.time; } break;
+            case 'syn': {
+                if (!S.audio) break;
+                const lat = (Date.now() - d.ts) / 1000;
+                const target = d.time + lat;
+                if (!S.audio.srcObject && Math.abs(S.audio.currentTime - target) > 0.25) {
+                    S.audio.currentTime = target;
+                }
+                if (d.playing && S.audio.paused) S.audio.play().catch(() => {});
+                if (!d.playing && !S.audio.paused) S.audio.pause();
+                setPlayBtn(d.playing);
+                if (S.duration && isFinite(S.duration)) updateProgress(target, S.duration);
+                break;
             }
-
-            case 'listener-join':  { if (!S.isDJ) { S.listeners.set(d.name, { name: d.name, color: rndColor() }); updateListeners(); toast(d.name + ' bergabung'); } break; }
-            case 'listener-leave': { if (!S.isDJ) { S.listeners.delete(d.name); updateListeners(); toast(d.name + ' keluar'); } break; }
+            case 'answer':
+                if (S.pc && S.pc.localDescription && S.pc.signalingState !== 'stable') {
+                    S.pc.setRemoteDescription(d.sdp).catch((e) => console.error('setRemote err', e));
+                }
+                break;
+            case 'ice':
+                if (S.pc && d.candidate) { try { S.pc.addIceCandidate(d.candidate); } catch (e) {} }
+                break;
+            case 'j':
+                if (d.id !== S.guestId) S.others.set(d.id, d.name);
+                updateListenersL();
+                break;
+            case 'l':
+                S.others.delete(d.id);
+                updateListenersL();
+                break;
         }
     }
 
-    // ─── AUDIO STREAM (DJ) ────────────────────────────────
-    function sendStreamTo(conn) {
-        if (!S.audioStream) return;
-        if (S.calls.has(conn.peer)) return;    // already streaming to this peer
-        const call = S.peer.call(conn.peer, S.audioStream);
-        call.on('error',  (e) => { console.error('call err', e); S.calls.delete(conn.peer); });
-        call.on('close',  ()  => S.calls.delete(conn.peer));
-        S.calls.set(conn.peer, call);
-    }
-
-    function ensureStreamToAll() {
-        S.conns.forEach(conn => sendStreamTo(conn));
-    }
-
-    function ensureStream() {
-        if (S.audioStream) return;
-        S.audioCtx   = new (window.AudioContext || window.webkitAudioContext)();
-        const source = S.audioCtx.createMediaElementSource(S.audio);
-        const dest   = S.audioCtx.createMediaStreamDestination();
-        source.connect(dest);
-        source.connect(S.audioCtx.destination);   // DJ hears audio
-        S.audioStream = dest.stream;
-        ensureStreamToAll();                       // backfill streams to existing listeners
-    }
-
-    // ─── SYNC ENGINE (DJ) ────────────────────────────────
-    function startSync() {
-        if (S.syncTimer) clearInterval(S.syncTimer);
-        S.syncTimer = setInterval(() => {
-            if (S.isDJ && S.audio && S.conns.length > 0) {
-                broadcast({
-                    type: 'sync',
-                    time: S.audio.currentTime,
-                    playing: !S.audio.paused,
-                    ts: Date.now(),
-                });
-            }
-        }, SYNC_INTERVAL_MS);
-    }
-
-    // ─── PLAYER ───────────────────────────────────────────
-    function playIdx(idx) {
-        if (!S.isDJ || idx < 0 || idx >= S.queue.length) return;
-        const song = S.queue[idx];
-        if (!song.url) { toast('File tidak tersedia'); return; }
-
-        ensureStream();
-        S.songIdx = idx;
-        S.audio.src = song.url;
-        S.audio.play().catch(() => {});
-        S.playing = true;
-
-        updateTrack(song.name);
-        updateQueue();
-        setPlayBtn(true);
-        S.duration = song.duration || 0;
-
-        ensureStreamToAll();   // make sure every connected listener has the stream
-        broadcast({ type: 'song-change', idx, name: song.name, dur: song.duration });
-    }
-
-    function nextSong() {
-        if (!S.isDJ || S.queue.length === 0) return;
-        playIdx((S.songIdx + 1) % S.queue.length);
-    }
-    function prevSong() {
-        if (!S.isDJ || S.queue.length === 0) return;
-        playIdx(S.songIdx <= 0 ? S.queue.length - 1 : S.songIdx - 1);
-    }
-
+    // ─── TRANSPORT (DJ) ────────────────────────────────────
     function togglePlay() {
         if (!S.isDJ || !S.audio) return;
         ensureStream();
         if (S.audio.paused) {
             S.audio.play().catch(() => {});
+            S.playing = true;
             setPlayBtn(true);
-            broadcast({ type: 'play' });
+            pub({ type: 'play' });
         } else {
             S.audio.pause();
+            S.playing = false;
             setPlayBtn(false);
-            broadcast({ type: 'pause' });
+            pub({ type: 'pause' });
         }
     }
-
+    function playIdx(idx) {
+        if (!S.isDJ || idx < 0 || idx >= S.queue.length) return;
+        const song = S.queue[idx];
+        if (!song.url) return;
+        ensureStream();
+        S.songIdx = idx;
+        S.audio.src = song.url;
+        S.audio.play().catch(() => {});
+        S.playing = true;
+        S.duration = song.dur || 0;
+        updateTrack(song.name);
+        updateQueue();
+        setPlayBtn(true);
+        pub({ type: 'song', idx, name: song.name, dur: song.dur });
+    }
+    function nextSong() { if (S.isDJ && S.queue.length) playIdx((S.songIdx + 1) % S.queue.length); }
+    function prevSong() { if (S.isDJ && S.queue.length) playIdx(S.songIdx <= 0 ? S.queue.length - 1 : S.songIdx - 1); }
     function seekTo(pct) {
         if (!S.isDJ || !S.audio || !S.audio.duration) return;
         const t = pct * S.audio.duration;
         S.audio.currentTime = t;
-        broadcast({ type: 'seek', time: t });
+        pub({ type: 'seek', time: t });
     }
-
     function removeSong(idx) {
         if (!S.isDJ || idx < 0 || idx >= S.queue.length) return;
         URL.revokeObjectURL(S.queue[idx].url);
         S.queue.splice(idx, 1);
-        broadcast({ type: 'queue-remove', idx });
-
-        if (S.queue.length === 0) {
+        pub({ type: 'qrm', idx });
+        if (!S.queue.length) {
             S.songIdx = -1; S.audio.src = ''; S.playing = false;
             updateTrack(null); updateQueue(); setPlayBtn(false);
         } else if (idx === S.songIdx) {
             playIdx(Math.min(idx, S.queue.length - 1));
-        } else if (idx < S.songIdx) {
-            S.songIdx--;
-            updateQueue();
         } else {
+            if (idx < S.songIdx) S.songIdx--;
             updateQueue();
         }
     }
 
-    // ─── FILE UPLOAD (DJ) ─────────────────────────────────
+    // ─── FILE UPLOAD (DJ) ──────────────────────────────────
     function handleFiles(files) {
         Array.from(files).forEach(f => {
             if (f.size > MAX_FILE_MB * 1048576) { toast(f.name + ' terlalu besar'); return; }
             const url = URL.createObjectURL(f);
             const name = f.name.replace(/\.[^/.]+$/, '');
-            const song = { name, url, size: f.size, file: f, duration: 0 };
-
-            const tmpAudio = new Audio(url);
-            tmpAudio.addEventListener('loadedmetadata', () => {
-                song.duration = tmpAudio.duration;
+            const song = { name, url, size: f.size, dur: 0 };
+            const t = new Audio(url);
+            t.addEventListener('loadedmetadata', () => {
+                song.dur = t.duration;
                 updateQueue();
-                broadcast({ type: 'queue-add', name: song.name, size: song.size, dur: song.duration });
+                pub({ type: 'qadd', name: song.name, size: song.size, dur: song.dur });
             });
-
             S.queue.push(song);
             updateQueue();
-            broadcast({ type: 'queue-add', name: song.name, size: song.size, dur: 0 });
-
+            pub({ type: 'qadd', name: song.name, size: song.size, dur: 0 });
             if (S.songIdx < 0) playIdx(S.queue.length - 1);
         });
     }
 
-    // ─── UI UPDATES ──────────────────────────────────────
+    // ─── SYNC ENGINE (DJ) ──────────────────────────────────
+    function startSync() {
+        if (S.syncT) clearInterval(S.syncT);
+        S.syncT = setInterval(() => {
+            if (S.isDJ && S.audio) {
+                pub({ type: 'syn', time: S.audio.currentTime, playing: !S.audio.paused, ts: Date.now() });
+            }
+        }, SYNC_INTERVAL_MS);
+    }
+
+    // ─── LEAVE / DESTROY ───────────────────────────────────
+    function leaveRoom() {
+        if (S.isDJ) pub({ type: 'bye' });
+        else {
+            pub({ type: 'bye', id: S.guestId });
+            if (S._stopGuestLoops) S._stopGuestLoops();
+        }
+        destroyAll();
+        goHome();
+    }
+    function destroyBroker() {
+        if (S.mq) { try { S.mq.end(true); } catch (_) {} S.mq = null; }
+        if (S.beatT) { clearInterval(S.beatT); S.beatT = null; }
+        if (S.syncT) { clearInterval(S.syncT); S.syncT = null; }
+        if (S.pubT)  { clearInterval(S.pubT);  S.pubT  = null; }
+        if (S.beatGT) { clearInterval(S.beatGT); S.beatGT = null; }
+        if (S._stopGuestLoops) { S._stopGuestLoops(); S._stopGuestLoops = null; }
+    }
+    function destroyAll() {
+        destroyBroker();
+        S.pcs.forEach((pc, id) => closePc(id));
+        S.guests.clear();
+        if (S.pc) closeGuestPc();
+        S.queue.forEach(s => { if (s.url) URL.revokeObjectURL(s.url); });
+        S.queue = [];
+        S.songIdx = -1;
+        S.playing = false;
+        S.duration = 0;
+        S.gotStream = false;
+        S.announced = false;
+        S.others.clear();
+        S.roomShown = false;
+    }
+
+    // ─── UI ────────────────────────────────────────────────
     function showRoom() {
         $('#home').classList.remove('active');
         $('#room').classList.add('active');
         $('#room-code').textContent = S.roomCode;
+        $('#btn-join').disabled = false;
+        $('#btn-create').disabled = false;
+        S.joinBusy = false;
+        setJoinStatus('');
         if (S.isDJ) $('#dj-controls').classList.remove('hidden');
-        // Listeners: freeze transport controls (DJ only)
+        else $('#dj-controls').classList.add('hidden');
         const locked = !S.isDJ;
         ['#btn-play', '#btn-next', '#btn-prev', '#btn-shuffle', '#btn-repeat'].forEach(sel => {
             $(sel).style.opacity = locked ? '0.35' : '1';
@@ -544,9 +567,8 @@
         $('#progress-bar').style.cursor = locked ? 'default' : 'pointer';
         if (S.isDJ) startSync();
         updateQueue();
-        updateListeners();
+        updateListenersL();
     }
-
     function goHome() {
         $('#home').classList.add('active');
         $('#room').classList.remove('active');
@@ -561,23 +583,21 @@
         $('#time-current').textContent = '0:00';
         $('#time-duration').textContent = '0:00';
         setPlayBtn(false);
-        const el = $('#join-status'); if (el) el.textContent = '';
         $('#btn-join').disabled = false;
         $('#btn-create').disabled = false;
+        setJoinStatus('');
+        S.joinBusy = false;
     }
-
     function updateTrack(name) {
         $('#track-title').textContent = name || 'Belum ada lagu';
         $('#track-artist').textContent = name ? (S.isDJ ? 'Sedang diputar' : 'DJ sedang memutar') : 'Upload musik untuk mulai';
         $('#album-art').classList.toggle('playing', !!name);
     }
-
     function setPlayBtn(on) {
         S.playing = on;
         $('#btn-play').textContent = on ? '⏸' : '▶';
         $('#album-art').classList.toggle('playing', on);
     }
-
     function updateProgress(time, dur) {
         if (!dur) return;
         const pct = (time / dur) * 100;
@@ -586,22 +606,19 @@
         $('#time-current').textContent = fmtTime(time);
         $('#time-duration').textContent = fmtTime(dur);
     }
-
     function updateQueue() {
         const list = $('#queue-list');
         $('#queue-count').textContent = '(' + S.queue.length + ')';
         if (!S.queue.length) { list.innerHTML = '<li class="queue-empty">Belum ada lagu</li>'; return; }
-
         list.innerHTML = S.queue.map((s, i) => `
             <li class="queue-item ${i === S.songIdx ? 'active' : ''}" data-i="${i}">
                 <span class="qi-index">${i === S.songIdx ? '▶' : i + 1}</span>
                 <div class="qi-info">
                     <div class="qi-title">${esc(s.name)}</div>
-                    <div class="qi-size">${fmtSize(s.size)}${s.duration ? ' · ' + fmtTime(s.duration) : ''}</div>
+                    <div class="qi-size">${fmtSize(s.size)}${s.dur ? ' · ' + fmtTime(s.dur) : ''}</div>
                 </div>
                 ${S.isDJ ? `<button class="qi-remove" data-i="${i}">✕</button>` : ''}
             </li>`).join('');
-
         list.querySelectorAll('.queue-item').forEach(el => {
             el.addEventListener('click', (e) => {
                 if (e.target.closest('.qi-remove')) return;
@@ -612,24 +629,28 @@
             btn.addEventListener('click', (e) => { e.stopPropagation(); removeSong(parseInt(btn.dataset.i)); });
         });
     }
-
-    function updateListeners() {
-        const n = S.listeners.size + (S.isDJ ? 1 : 0);
+    function updateListenersL() {
+        const list = $('#listener-list');
+        const n = (S.isDJ ? S.guests.size + 1 : S.others.size + 1);
         $('#listener-count').textContent = '👥 ' + n;
         let html = '';
-        if (S.isDJ) html += `<li class="listener-item"><div class="listener-avatar" style="background:var(--accent)">DJ</div><span class="listener-name">Kamu (DJ)</span><span class="listener-tag">DJ</span></li>`;
-        S.listeners.forEach(l => {
-            html += `<li class="listener-item"><div class="listener-avatar" style="background:${l.color}">${l.name[0]}</div><span class="listener-name">${esc(l.name)}</span></li>`;
+        if (S.isDJ) {
+            html += `<li class="listener-item"><div class="listener-avatar" style="background:var(--accent)">DJ</div><span class="listener-name">Kamu (DJ)</span><span class="listener-tag">DJ</span></li>`;
+        } else {
+            html += `<li class="listener-item"><div class="listener-avatar" style="background:var(--accent)">DJ</div><span class="listener-name">DJ</span><span class="listener-tag">DJ</span></li>`;
+        }
+        const roster = S.isDJ ? S.guests : S.others;
+        roster.forEach((g) => {
+            html += `<li class="listener-item"><div class="listener-avatar" style="background:${rndColor()}">${g.name[0]}</div><span class="listener-name">${esc(g.name)}</span></li>`;
         });
-        $('#listener-list').innerHTML = html;
+        list.innerHTML = html;
     }
 
-    // ─── INIT ─────────────────────────────────────────────
+    // ─── INIT ──────────────────────────────────────────────
     document.addEventListener('DOMContentLoaded', () => {
         S.audio = $('#audio');
         S.audio.volume = 0.75;
 
-        // ── Audio events (DJ) ──
         S.audio.addEventListener('timeupdate', () => {
             if (S.isDJ) updateProgress(S.audio.currentTime, S.audio.duration);
         });
@@ -638,34 +659,25 @@
         });
         S.audio.addEventListener('ended', () => { if (S.isDJ) nextSong(); });
 
-        // ── Home buttons ──
         $('#btn-create').addEventListener('click', createRoom);
-        $('#btn-join').addEventListener('click', () => {
-            const code = $('#input-code').value.trim().toUpperCase();
-            if (code.length < 4) { toast('Masukkan kode ruangan'); return; }
-            joinRoom(code);
-        });
+        $('#btn-join').addEventListener('click', () => joinRoom($('#input-code').value.trim().toUpperCase()));
         $('#input-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#btn-join').click(); });
 
-        // ── Room controls ──
         $('#btn-leave').addEventListener('click', leaveRoom);
         $('#room-code').addEventListener('click', () => {
             navigator.clipboard.writeText(S.roomCode).then(() => toast('Kode disalin!')).catch(() => {});
         });
 
-        // ── File upload ──
         $('#file-input').addEventListener('change', (e) => { handleFiles(e.target.files); e.target.value = ''; });
         const ua = $('#upload-area');
         ua.addEventListener('dragover',  (e) => { e.preventDefault(); ua.classList.add('dragover'); });
         ua.addEventListener('dragleave', ()  => ua.classList.remove('dragover'));
         ua.addEventListener('drop',      (e) => { e.preventDefault(); ua.classList.remove('dragover'); handleFiles(e.dataTransfer.files); });
 
-        // ── Playback controls ──
         $('#btn-play').addEventListener('click', togglePlay);
         $('#btn-next').addEventListener('click', nextSong);
         $('#btn-prev').addEventListener('click', prevSong);
 
-        // ── Progress bar seek ──
         let seeking = false;
         const pbar = $('#progress-bar');
         function seekFromEvent(e) {
@@ -674,16 +686,13 @@
         }
         pbar.addEventListener('mousedown', (e) => { seeking = true; seekFromEvent(e); });
         document.addEventListener('mousemove', (e) => { if (seeking) seekFromEvent(e); });
-        document.addEventListener('mouseup',   ()  => { seeking = false; });
-        // Touch
+        document.addEventListener('mouseup',  ()  => { seeking = false; });
         pbar.addEventListener('touchstart', (e) => { seeking = true; seekFromEvent(e.touches[0]); }, { passive: true });
         document.addEventListener('touchmove', (e) => { if (seeking) seekFromEvent(e.touches[0]); }, { passive: true });
         document.addEventListener('touchend',  ()  => { seeking = false; });
 
-        // ── Volume ──
         $('#volume-slider').addEventListener('input', (e) => { S.audio.volume = e.target.value / 100; });
 
-        // ── Placeholder buttons ──
         $('#btn-shuffle').addEventListener('click', () => toast('Shuffle: segera'));
         $('#btn-repeat').addEventListener('click',  () => toast('Repeat: segera'));
     });
