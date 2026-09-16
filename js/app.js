@@ -49,6 +49,10 @@
         syncT:    null,
         screenStream: null,
         screenActive: false,
+        screenAudT: null,
+        screenAudCtx: null,
+        screenAudRms: 0,
+        screenAudWarned: false,
 
         // Guest
         guestId:  'g-' + Math.random().toString(36).slice(2, 8),
@@ -95,22 +99,26 @@
         const c = ['#e91e63','#9c27b0','#673ab7','#3f51b5','#2196f3','#00bcd4','#009688','#4caf50','#ff9800','#ff5722'];
         return c[Math.floor(Math.random() * c.length)];
     }
-    // HD Opus: 512kbps stereo full-band via SDP munging
+    // HD Opus (512kbps stereo) + batasi bitrate video agar stabil di jalur biasa
     function mungeHdSdp(sdp) {
         if (sdp && typeof sdp === 'object' && typeof sdp.sdp === 'string') sdp = sdp.sdp;
         if (typeof sdp !== 'string') return sdp || '';
         const m = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/);
-        if (!m) return sdp;
-        const pt = m[1];
-        return sdp.replace(
-            new RegExp('a=fmtp:' + pt + ' ([^\r\n]*)'),
-            (all, params) => {
-                const hd = ['maxaveragebitrate=512000','maxplaybackrate=48000','stereo=1','sprop-stereo=1'];
-                let p = params;
-                for (const h of hd) if (!p.includes(h.split('=')[0])) p += ';' + h;
-                return 'a=fmtp:' + pt + ' ' + p;
-            }
-        );
+        if (m) {
+            const pt = m[1];
+            sdp = sdp.replace(
+                new RegExp('a=fmtp:' + pt + ' ([^\r\n]*)'),
+                (all, params) => {
+                    const hd = ['maxaveragebitrate=512000','maxplaybackrate=48000','stereo=1','sprop-stereo=1'];
+                    let p = params;
+                    for (const h of hd) if (!p.includes(h.split('=')[0])) p += ';' + h;
+                    return 'a=fmtp:' + pt + ' ' + p;
+                }
+            );
+        }
+        // bitrate video ≈2Mbps (jika m=video ada dan belum ada b=AS di baris itu)
+        sdp = sdp.replace(/^m=video[^\r\n]*(?:\r?\n)(?!b=AS:)/m, '$&b=AS:2000\r\n');
+        return sdp;
     }
     function hintMusic(track) { try { if (track) track.contentHint = 'music'; } catch (_) {} }
     function toast(msg) {
@@ -223,7 +231,8 @@
     function attachDjTracks(pc) {
         if (S.screenActive && S.screenStream) {
             const vid = S.screenStream.getVideoTracks()[0];
-            const aud = S.screenStream.getAudioTracks()[0];
+            let aud = S.screenStream.getAudioTracks()[0];
+            if (aud && !aud.enabled) aud = null;
             if (aud) hintMusic(aud);
             if (vid) { pc.addTrack(vid, S.screenStream); console.log('[mtm] SCREEN video ke pc'); }
             if (aud) { pc.addTrack(aud, S.screenStream); console.log('[mtm] SCREEN audio (sistem) ke pc — musik lewat layar'); }
@@ -293,7 +302,7 @@
         } else {
             const st = S.pc ? S.pc.connectionState : 'new';
             switch (st) {
-                case 'connected': setConn('🔊 Terhubung ke DJ', 'ok'); break;
+                case 'connected': setConn('🔊 Terhubung ke DJ' + (S.gotVideo ? ' · 🖥️' : ''), 'ok'); break;
                 case 'failed':    setConn('⚠️ Koneksi gagal — mencoba ulang…', 'bad'); break;
                 case 'closed':    setConn('Koneksi ditutup', 'warn'); break;
                 default:          setConn('Menghubungkan…'); break;
@@ -313,7 +322,7 @@
             if (ev.track.kind === 'video') {
                 S.gotVideo = true;
                 const v = $('#screen-video');
-                if (v) v.srcObject = new MediaStream([ev.track]);
+                if (v) { v.srcObject = new MediaStream([ev.track]); v.play().catch(() => {}); }
                 const p = $('#screen-panel'); if (p) p.classList.remove('hidden');
                 console.log('[mtm] guest terima VIDEO track');
                 return;
@@ -372,7 +381,7 @@
         let stream;
         try {
             stream = await navigator.mediaDevices.getDisplayMedia({
-                video: { frameRate: { ideal: 24, max: 30 } },
+                video: { width: { ideal: 1280, max: 1920 }, height: { ideal: 720, max: 1080 }, frameRate: { ideal: 24, max: 30 } },
                 audio: {
                     suppressLocalAudioPlayback: true,
                     echoCancellation: false,
@@ -391,24 +400,65 @@
         if (!stream.getVideoTracks()[0]) { toast('Tidak ada video dari pilihan layar'); try { stream.getTracks().forEach(t => t.stop()); } catch (_) {} return; }
         S.screenStream = stream;
         S.screenActive = true;
-        const a = stream.getAudioTracks()[0];
+        let a = stream.getAudioTracks()[0];
+        if (a && !a.enabled) a = null;                    // track dimatikan → anggap tanpa audio
         if (a) hintMusic(a);
         // Preview untuk DJ (muted — DJ dengar audio asli dari speaker sendiri)
         const v = $('#screen-video');
-        if (v) { v.srcObject = stream; }
+        if (v) { v.srcObject = stream; v.play().catch(() => {}); }
         const panel = $('#screen-panel'); if (panel) panel.classList.remove('hidden');
         $('#btn-stop-screen').hidden = false;
         $('#btn-share-screen').classList.add('active');
         // Hentikan saat user stop lewat UI browser
         const vt = stream.getVideoTracks()[0];
         if (vt) vt.onended = () => { if (S.screenActive) stopScreenShare(); };
-        pub({ type: 'screen', active: true });
-        console.log('[mtm] screen share ON, audio=', !!a);
+        // Cek hitam: apakah frame benar-benar dirender? (jendela diminimalkan = hitam)
+        setTimeout(() => {
+            const vv = $('#screen-video');
+            if (S.screenActive && vv && vv.srcObject && !vv.videoWidth) {
+                console.warn('[mtm] PREVIEW HITAM — no frames (videoWidth=0). Window mungkin diminimalkan.');
+                toast('⚠️ Layar tampak kosong — pastikan sumber layar tidak diminimalkan');
+            }
+        }, 1500);
+        // Pantau volume audio layar: jika layar tanpa suara padahal musik diputar → beri tahu
+        watchScreenAudio(stream);
+        pub({ type: 'screen', active: true, aud: !!a });
+        console.log('[mtm] screen share ON, audio=', !!a, 'size=', vt.getSettings && vt.getSettings().width + 'x' + vt.getSettings().height);
         toast(a ? '🖥️ Layar + audio sistem sedang dibagikan' : '🖥️ Layar dibagikan (audio tetap dari player)');
         // Guest harus re-konek untuk dapat layout baru
         bounceAllGuests();
     }
+    function watchScreenAudio(stream) {
+        try {
+            if (S.screenAudCtx) { try { S.screenAudCtx.close(); } catch (_) {} }
+            const sc = new (window.AudioContext || window.webkitAudioContext)();
+            S.screenAudCtx = sc;
+            const src = sc.createMediaStreamSource(stream);
+            const an = sc.createAnalyser(); an.fftSize = 1024;
+            src.connect(an);
+            let silent = 0;
+            if (S.screenAudT) clearInterval(S.screenAudT);
+            S.screenAudT = setInterval(() => {
+                if (!S.screenActive || !S.screenStream) return;
+                const b = new Float32Array(an.fftSize);
+                an.getFloatTimeDomainData(b);
+                let sum = 0; for (let i = 0; i < b.length; i++) sum += b[i] * b[i];
+                S.screenAudRms = Math.sqrt(sum / b.length);
+                if (S.screenAudRms < 0.001) {
+                    if (++silent >= 5 && S.queue.length) {
+                        console.warn('[mtm] audio layar SUNYI (rms=', S.screenAudRms.toFixed(5), ')');
+                        S.screenAudWarned = true;
+                        toast('🔇 Layar tanpa audio — musik ikut dari player');
+                        silent = 0;
+                    }
+                } else { silent = 0; }
+            }, 1000);
+        } catch (_) { S.screenAudRms = -1; }
+    }
     function stopScreenShare() {
+        if (S.screenAudT) { clearInterval(S.screenAudT); S.screenAudT = null; }
+        if (S.screenAudCtx) { try { S.screenAudCtx.close(); } catch (_) {} S.screenAudCtx = null; }
+        S.screenAudRms = 0;
         if (S.screenStream) { try { S.screenStream.getTracks().forEach(t => t.stop()); } catch (_) {} S.screenStream = null; }
         S.screenActive = false;
         hideScreenUi();
@@ -804,6 +854,9 @@
         if (S.pubT)  { clearInterval(S.pubT);  S.pubT  = null; }
         if (S.rmsT)  { clearInterval(S.rmsT);  S.rmsT  = null; }
         S.djRms = 0;
+        if (S.screenAudT) { clearInterval(S.screenAudT); S.screenAudT = null; }
+        if (S.screenAudCtx) { try { S.screenAudCtx.close(); } catch (_) {} S.screenAudCtx = null; }
+        S.screenAudRms = 0;
         if (S.beatGT) { clearInterval(S.beatGT); S.beatGT = null; }
         if (S._stopGuestLoops) { S._stopGuestLoops(); S._stopGuestLoops = null; }
     }
@@ -985,6 +1038,7 @@
         // Gestur pertama di mana saja membebaskan autoplay (browser asli mblokir tanpa interaksi)
         const unblockOnce = () => {
             try { if (S.audio && S.audio.srcObject) S.audio.play().catch(() => {}); } catch (_) {}
+            try { const v = $('#screen-video'); if (v && v.srcObject) v.play().catch(() => {}); } catch (_) {}
             if (S.audio && !S.audio.paused) hideTapToHear();
             document.removeEventListener('pointerdown', unblockOnce);
         };
@@ -1012,8 +1066,20 @@
                     queueLen: S.queue.length,
                     screenActive: !!S.screenActive,
                     screenStream: !!S.screenStream,
+                    screenAudRms: S.screenAudRms,
                     gotVideo: S.gotVideo,
+                    videoReceived: S.gotVideo,
+                    mediaPlaying: S.audio ? !S.audio.paused : false,
+                    iceState: S.pc ? S.pc.iceConnectionState : (S.isDJ ? '' : 'none'),
                 };
+            },
+            // salin laporan diagnosis ke clipboard — paste ke chat developer
+            report: () => {
+                const data = 'MTM-DIAG ' + (navigator.userAgent.match(/Chrome\/(\S+)|Firefox\/(\S+)|Safari\/(\S+)/) || ['', ''])[0]
+                    + '\n' + JSON.stringify(window.__mtm.state, null, 2);
+                try { navigator.clipboard.writeText(data).then(() => toast('📋 Diagnosis tersalin — paste ke chat')).catch(() => toast('Gagal menyalin')); }
+                catch (_) { toast('Gagal menyalin'); }
+                return data;
             },
             toast: (m) => toast(m),
         };
