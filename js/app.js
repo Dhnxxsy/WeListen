@@ -73,6 +73,9 @@
         duration: 0,
 
         joinBusy: false,
+        _ready: false,
+        _offering: false,
+        failCount: 0,
     };
 
     // ─── DOM ───────────────────────────────────────────────
@@ -158,7 +161,16 @@
             });
             client.on('connect', () => {
                 S.mq = client;
-                client.subscribe(S.topic, { qos: 0 });
+                client.subscribe(S.topic, { qos: 1 });
+                if (S._ready) {
+                    // broker reconnect (clean session hilang topik) → daftar ulang tanpa duplikasi handler
+                    if (!S.isDJ) {
+                        pub({ type: 'hello', id: S.guestId, name: 'Pengguna' }, 0);
+                        setTimeout(() => guestOffer(), 300);
+                    }
+                    return;
+                }
+                S._ready = true;
                 onReady();
             });
             client.on('message', (t, p) => { try { guarded(dec(p)); } catch (e) {} });
@@ -173,10 +185,10 @@
         }
         tryNext();
     }
-    function pub(obj) {
+    function pub(obj, qos) {
         if (!S.mq) return;
         obj.src = S.isDJ ? 'dj' : S.guestId;   // self-echo filter
-        S.mq.publish(S.topic, JSON.stringify(obj));
+        try { S.mq.publish(S.topic, JSON.stringify(obj), { qos: qos || 1 }); } catch (_) {}
     }
     function selfSrc() { return S.isDJ ? 'dj' : S.guestId; }
 
@@ -253,8 +265,16 @@
         if (!S.djTrack) ensureStream();
         const pc = new RTCPeerConnection(RTC_OPTS);
         S.pcs.set(guestId, pc);
+        pc._cands = [];
         attachDjTracks(pc);
-        pc.onicecandidate = (e) => { if (e.candidate) pub({ type: 'ice', to: guestId, candidate: e.candidate }); };
+        pc.onicecandidate = (e) => {
+            if (e.candidate) {
+                pc._cands.push(e.candidate);
+                pub({ type: 'ice', to: guestId, candidate: e.candidate }, 1);
+            } else if (pc._cands.length) {
+                pub({ type: 'cands', to: guestId, cands: pc._cands }, 1);   // batch redundan saat gathering selesai
+            }
+        };
         pc.onconnectionstatechange = () => {
             if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
                 closePc(guestId);
@@ -267,7 +287,14 @@
             pc._pending = [];
             const ans = mungeHdSdp((await pc.createAnswer()).sdp);
             await pc.setLocalDescription({ type: 'answer', sdp: ans });
-            pub({ type: 'answer', to: guestId, sdp: pc.localDescription });
+            pub({ type: 'answer', to: guestId, sdp: pc.localDescription }, 1);
+            // Jawaban bisa hilang di broker → kirim ulang jika belum terkoneksi
+            [1500, 4000].forEach(ms => setTimeout(() => {
+                const cur = S.pcs.get(guestId);
+                if (cur === pc && pc.connectionState !== 'connected') {
+                    pub({ type: 'answer', to: guestId, sdp: pc.localDescription }, 1);
+                }
+            }, ms));
         } catch (e) {
             console.error('answerGuest error', e);
             closePc(guestId);
@@ -281,11 +308,13 @@
         const pc = S.pcs.get(guestId);
         if (pc) { try { pc.close(); } catch (_) {} S.pcs.delete(guestId); }
     }
-    function addIce(guestId, cand) {
-        const pc = S.pcs.get(guestId);
-        if (!pc || !cand) return;
+    function applyCand(pc, cand) {
+        if (!pc || !cand || !cand.candidate) return;
         if (pc.remoteDescription) { try { pc.addIceCandidate(cand); } catch (_) {} }
-        else { (pc._pending = pc._pending || []).push(cand); }   // buffer kandidat dini (Firefox)
+        else { (pc._pending = pc._pending || []).push(cand); }
+    }
+    function addIce(guestId, cand) {
+        applyCand(S.pcs.get(guestId), cand);
     }
     function setConn(msg, cls) {
         const el = $('#conn-status');
@@ -312,12 +341,23 @@
 
     // Guest side: recvonly audio+video, trickle ICE, apply answer
     async function guestOffer() {
-        if (S.isDJ || S.pc) return;
+        if (S.isDJ || S.pc || S._offering) return;
+        S._offering = true;
         setConn('Menghubungkan…');
-        const pc = new RTCPeerConnection(RTC_OPTS);
-        pc.addTransceiver('audio', { direction: 'recvonly' });
-        pc.addTransceiver('video', { direction: 'recvonly' });
-        pc.onicecandidate = (e) => { if (e.candidate) pub({ type: 'ice', id: S.guestId, candidate: e.candidate }); };
+        let pc;
+        try { pc = new RTCPeerConnection(RTC_OPTS); }
+        catch (e) { console.error('pc create err', e); S._offering = false; return; }
+        try { pc.addTransceiver('audio', { direction: 'recvonly' }); pc.addTransceiver('video', { direction: 'recvonly' }); }
+        catch (e) { try { pc.close(); } catch (_) {} S._offering = false; return; }
+        pc._cands = [];
+        pc.onicecandidate = (e) => {
+            if (e.candidate) {
+                pc._cands.push(e.candidate);
+                pub({ type: 'ice', id: S.guestId, candidate: e.candidate }, 1);
+            } else if (pc._cands.length) {
+                pub({ type: 'cands', id: S.guestId, cands: pc._cands }, 1);   // batch redundan saat gathering selesai
+            }
+        };
         pc.ontrack = (ev) => {
             if (ev.track.kind === 'video') {
                 S.gotVideo = true;
@@ -339,20 +379,34 @@
             connMon();
             if (pc.connectionState === 'connected') {
                 setJoinStatus('');
+                S.failCount = 0;
                 if (!S.announced) { S.announced = true; toast('Berhasil gabung!'); }
             }
             if (pc.connectionState === 'failed') {
                 if (pc._watch) { clearTimeout(pc._watch); pc._watch = null; }
                 closeGuestPc();
                 S.gotStream = false;
-                toast('Koneksi audio bermasalah — mencoba ulang…');
+                S.failCount = (S.failCount || 0) + 1;
+                if (S.failCount >= 3) {
+                    S.failCount = 0;
+                    toast('⚠️ Koneksi gagal — cek jaringan, DJ & kamu harus di WiFi yang sama');
+                } else {
+                    toast('Koneksi audio bermasalah — mencoba ulang…');
+                }
+                setTimeout(() => guestOffer(), 1500);
             }
         };
         S.pc = pc;
         try {
             const offer = mungeHdSdp((await pc.createOffer()).sdp);
             await pc.setLocalDescription({ type: 'offer', sdp: offer });
-            pub({ type: 'offer', id: S.guestId, sdp: pc.localDescription });
+            pub({ type: 'offer', id: S.guestId, sdp: pc.localDescription }, 1);
+            // Jika jawaban hilang di broker, kirim ulang offer yang sama (idempoten)
+            [1500, 4000].forEach(ms => setTimeout(() => {
+                if (S.pc === pc && pc.signalingState === 'have-local-offer' && !S.gotStream) {
+                    pub({ type: 'offer', id: S.guestId, sdp: pc.localDescription }, 1);
+                }
+            }, ms));
         } catch (e) {
             console.error('guestOffer error', e);
             closeGuestPc();
@@ -365,6 +419,7 @@
                 guestOffer();
             }
         }, 6000);
+        S._offering = false;
     }
     function hideGuestScreen() {
         const v = $('#screen-video'); if (v) v.srcObject = null;
@@ -522,7 +577,7 @@
 
             // Heartbeat DJ + roster sweep
             S.beatT = setInterval(() => {
-                pub({ type: 'beat' });
+                pub({ type: 'beat' }, 0);
                 const now = Date.now();
                 S.guests.forEach((g, id) => {
                     if (now - g.lastSeen > GUEST_TIMEOUT_MS) {
@@ -563,12 +618,23 @@
                 pubState();
                 break;
             }
-            case 'offer':
+            case 'offer': {
                 S.guests.set(d.id, { name: S.guests.get(d.id)?.name || d.name || 'Pengguna', lastSeen: Date.now() });
+                // Offer yang sama dikirim ulang (transmisi hilang di broker) → kirim ulang answer yang sudah ada
+                const ex = S.pcs.get(d.id);
+                const offerSdp = (d.sdp && d.sdp.sdp) ? d.sdp.sdp : d.sdp;
+                if (ex && ex.remoteDescription && ex.remoteDescription.sdp === offerSdp && ex.localDescription) {
+                    pub({ type: 'answer', to: d.id, sdp: ex.localDescription }, 1);
+                    break;
+                }
                 answerGuest(d.id, d.sdp);
                 break;
+            }
             case 'ice':
                 addIce(d.id, d.candidate);
+                break;
+            case 'cands':
+                if (Array.isArray(d.cands)) { const pc = S.pcs.get(d.id); (d.cands || []).forEach(c => applyCand(pc, c)); }
                 break;
             case 'answer': {
                 const pc = S.pcs.get(d.id);
@@ -609,7 +675,7 @@
             dj: true,
             screen: S.screenActive,
             guests: Array.from(S.guests).map(([id, g]) => ({ id, name: g.name })),
-        });
+        }, 0);
     }
 
     // ─── ROOM — GUEST ──────────────────────────────────────
@@ -632,7 +698,7 @@
                 if (!S.gotStream) guestOffer();
             }, 6000);
             S.beatGT = setInterval(() => {
-                pub({ type: 'beatG', id: S.guestId, name: 'Pengguna' });
+                pub({ type: 'beatG', id: S.guestId, name: 'Pengguna' }, 0);
             }, BEAT_GUEST_MS);
 
             // DJ presence watchdog
@@ -734,10 +800,11 @@
                 break;
             case 'ice':
                 if (d.to !== S.guestId) break;
-                if (S.pc && d.candidate) {
-                    if (S.pc.remoteDescription) { try { S.pc.addIceCandidate(d.candidate); } catch (_) {} }
-                    else { (S.pc._pending = S.pc._pending || []).push(d.candidate); }
-                }
+                applyCand(S.pc, d.candidate);
+                break;
+            case 'cands':
+                if (d.to !== S.guestId || !Array.isArray(d.cands)) break;
+                (d.cands || []).forEach(c => applyCand(S.pc, c));
                 break;
             case 'j':
                 if (d.id !== S.guestId) S.others.set(d.id, d.name);
@@ -832,7 +899,7 @@
         if (S.syncT) clearInterval(S.syncT);
         S.syncT = setInterval(() => {
             if (S.isDJ && S.audio) {
-                pub({ type: 'syn', time: S.audio.currentTime, playing: !S.audio.paused, ts: Date.now() });
+                pub({ type: 'syn', time: S.audio.currentTime, playing: !S.audio.paused, ts: Date.now() }, 0);
             }
         }, SYNC_INTERVAL_MS);
     }
@@ -849,6 +916,8 @@
     }
     function destroyBroker() {
         if (S.mq) { try { S.mq.end(true); } catch (_) {} S.mq = null; }
+        S._ready = false;
+        S.failCount = 0;
         if (S.beatT) { clearInterval(S.beatT); S.beatT = null; }
         if (S.syncT) { clearInterval(S.syncT); S.syncT = null; }
         if (S.pubT)  { clearInterval(S.pubT);  S.pubT  = null; }
@@ -1071,6 +1140,7 @@
                     videoReceived: S.gotVideo,
                     mediaPlaying: S.audio ? !S.audio.paused : false,
                     iceState: S.pc ? S.pc.iceConnectionState : (S.isDJ ? '' : 'none'),
+                    failCount: S.failCount,
                 };
             },
             // salin laporan diagnosis ke clipboard — paste ke chat developer
