@@ -39,10 +39,15 @@
         djStream: null,
         djTrack:  null,
         djCtx:    null,
+        djAnalyser: null,
+        djRms:    0,
+        rmsT:     null,
         pcs:      new Map(),     // guestId → RTCPeerConnection
         guests:   new Map(),     // guestId → {name, lastSeen}
         beatT:    null,
         syncT:    null,
+        screenStream: null,
+        screenActive: false,
 
         // Guest
         guestId:  'g-' + Math.random().toString(36).slice(2, 8),
@@ -53,6 +58,7 @@
         djAlive:  0,            // last time DJ seen (ms)
         beatGT:   null,
         pubT:     null,   // DJ broadcast state periodik
+        rmsWarned: false,
 
         audio:    null,
         queue:    [],   // [{name, url, size, dur}]
@@ -87,6 +93,24 @@
         const c = ['#e91e63','#9c27b0','#673ab7','#3f51b5','#2196f3','#00bcd4','#009688','#4caf50','#ff9800','#ff5722'];
         return c[Math.floor(Math.random() * c.length)];
     }
+    // HD Opus: 512kbps stereo full-band via SDP munging
+    function mungeHdSdp(sdp) {
+        if (sdp && typeof sdp === 'object' && typeof sdp.sdp === 'string') sdp = sdp.sdp;
+        if (typeof sdp !== 'string') return sdp || '';
+        const m = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/);
+        if (!m) return sdp;
+        const pt = m[1];
+        return sdp.replace(
+            new RegExp('a=fmtp:' + pt + ' ([^\r\n]*)'),
+            (all, params) => {
+                const hd = ['maxaveragebitrate=512000','maxplaybackrate=48000','stereo=1','sprop-stereo=1'];
+                let p = params;
+                for (const h of hd) if (!p.includes(h.split('=')[0])) p += ';' + h;
+                return 'a=fmtp:' + pt + ' ' + p;
+            }
+        );
+    }
+    function hintMusic(track) { try { if (track) track.contentHint = 'music'; } catch (_) {} }
     function toast(msg) {
         const box = $('#toast-container');
         const el = document.createElement('div');
@@ -155,26 +179,70 @@
             const dest = S.djCtx.createMediaStreamDestination();
             src.connect(dest);
             src.connect(S.djCtx.destination);   // DJ dengar lagu
+            S.djAnalyser = S.djCtx.createAnalyser();
+            S.djAnalyser.fftSize = 1024;
+            src.connect(S.djAnalyser);          // self-test: ukur RMS capture
             S.djStream = dest.stream;
             S.djTrack = dest.stream.getAudioTracks()[0];
+            hintMusic(S.djTrack);
+            console.log('[mtm] DJ capture dibuat, track=', !!S.djTrack, 'ctx=', S.djCtx.state, 'rmsPath=on');
+            // Renegosiasi untuk guest yang terlanjur dapet answer tanpa track
+            if (S.djTrack) {
+                S.pcs.forEach((_pc, gid) => { if (_pc.getSenders().length === 0) reansGuest(gid); });
+            }
         } catch (e) {
             console.error('ensureStream error', e);
         }
     }
+    function djRms() {
+        if (!S.djAnalyser) return 0;
+        const n = S.djAnalyser.fftSize;
+        const buf = new Float32Array(n);
+        S.djAnalyser.getFloatTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < n; i++) sum += buf[i] * buf[i];
+        return Math.sqrt(sum / n);
+    }
+    // Renegosiasi: attach track ke guest yang jawabannya tidak punya audio
+    async function reansGuest(guestId) {
+        const pc = S.pcs.get(guestId);
+        if (!pc || !S.djTrack || pc.getSenders().length > 0) return;
+        pc.addTrack(S.djTrack, S.djStream);
+        console.log('[mtm] renegosiasi track untuk guest', guestId);
+        try {
+            const offer = mungeHdSdp((await pc.createOffer()).sdp);
+            await pc.setLocalDescription({ type: 'offer', sdp: offer });
+            pub({ type: 'reans', to: guestId, sdp: pc.localDescription });
+        } catch (e) { console.error('reansGuest error', e); }
+    }
 
     // ─── WEBRTC ────────────────────────────────────────────
-    // DJ side: answer guest's recvonly offer, attach djTrack
+    // Tentukan track apa yang dikirim: screen (video+audio sistem) atau audio lagu biasa
+    function attachDjTracks(pc) {
+        if (S.screenActive && S.screenStream) {
+            const vid = S.screenStream.getVideoTracks()[0];
+            const aud = S.screenStream.getAudioTracks()[0];
+            if (aud) hintMusic(aud);
+            if (vid) { pc.addTrack(vid, S.screenStream); console.log('[mtm] SCREEN video ke pc'); }
+            if (aud) { pc.addTrack(aud, S.screenStream); console.log('[mtm] SCREEN audio (sistem) ke pc — musik lewat layar'); }
+            else if (S.djTrack) { pc.addTrack(S.djTrack, S.djStream); console.log('[mtm] layar TANPA audio → kirim audio player'); }
+            return vid !== undefined || aud !== undefined || S.djTrack !== undefined;
+        }
+        if (S.djTrack) {
+            pc.addTrack(S.djTrack, S.djStream);
+            console.log('[mtm] DJ attach track ke guest');
+            return true;
+        }
+        console.warn('[mtm] DJ belum punya track saat answer guest');
+        return false;
+    }
+    // DJ side: answer guest's recvonly offer
     async function answerGuest(guestId, offerSdp) {
         closePc(guestId);
         if (!S.djTrack) ensureStream();
         const pc = new RTCPeerConnection(RTC_OPTS);
         S.pcs.set(guestId, pc);
-        if (S.djTrack) {
-            pc.addTrack(S.djTrack, S.djStream);
-            console.log('[mtm] DJ attach track ke guest', guestId);
-        } else {
-            console.warn('[mtm] DJ belum punya track saat answer guest', guestId);
-        }
+        attachDjTracks(pc);
         pc.onicecandidate = (e) => { if (e.candidate) pub({ type: 'ice', to: guestId, candidate: e.candidate }); };
         pc.onconnectionstatechange = () => {
             if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
@@ -183,13 +251,17 @@
         };
         try {
             await pc.setRemoteDescription(offerSdp);
-            const ans = await pc.createAnswer();
-            await pc.setLocalDescription(ans);
+            const ans = mungeHdSdp((await pc.createAnswer()).sdp);
+            await pc.setLocalDescription({ type: 'answer', sdp: ans });
             pub({ type: 'answer', to: guestId, sdp: pc.localDescription });
         } catch (e) {
             console.error('answerGuest error', e);
             closePc(guestId);
         }
+    }
+    // Guest yang sudah terhubung di-close → mereka re-offer & dapat layout baru
+    function bounceAllGuests() {
+        S.pcs.forEach((_pc, gid) => closePc(gid));
     }
     function closePc(guestId) {
         const pc = S.pcs.get(guestId);
@@ -200,15 +272,23 @@
         if (pc && cand) { try { pc.addIceCandidate(cand); } catch (e) {} }
     }
 
-    // Guest side: recvonly audio, trickle ICE, apply answer
+    // Guest side: recvonly audio+video, trickle ICE, apply answer
     async function guestOffer() {
         if (S.isDJ || S.pc) return;
         const pc = new RTCPeerConnection(RTC_OPTS);
         pc.addTransceiver('audio', { direction: 'recvonly' });
+        pc.addTransceiver('video', { direction: 'recvonly' });
         pc.onicecandidate = (e) => { if (e.candidate) pub({ type: 'ice', id: S.guestId, candidate: e.candidate }); };
         pc.ontrack = (ev) => {
+            if (ev.track.kind === 'video') {
+                const v = $('#screen-video');
+                if (v) v.srcObject = new MediaStream([ev.track]);
+                const p = $('#screen-panel'); if (p) p.classList.remove('hidden');
+                console.log('[mtm] guest terima VIDEO track');
+                return;
+            }
             S.gotStream = true;
-            S.audio.srcObject = ev.streams[0] || ev.stream;
+            S.audio.srcObject = new MediaStream([ev.track]);
             S.audio.muted = false;
             hideTapToHear();
             console.log('[mtm] guest terima track audio, peerState=', pc.connectionState);
@@ -227,13 +307,83 @@
         };
         S.pc = pc;
         try {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
+            const offer = mungeHdSdp((await pc.createOffer()).sdp);
+            await pc.setLocalDescription({ type: 'offer', sdp: offer });
             pub({ type: 'offer', id: S.guestId, sdp: pc.localDescription });
         } catch (e) {
             console.error('guestOffer error', e);
             closeGuestPc();
         }
+    }
+    function hideGuestScreen() {
+        const v = $('#screen-video'); if (v) v.srcObject = null;
+        const p = $('#screen-panel'); if (p) p.classList.add('hidden');
+    }
+
+    // ─── SHARE SCREEN (DJ) ─────────────────────────────────
+    async function startScreenShare() {
+        if (!S.isDJ || S.screenActive) return;
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+            toast('Browser tidak mendukung share screen');
+            return;
+        }
+        let stream;
+        try {
+            stream = await navigator.mediaDevices.getDisplayMedia({
+                video: { frameRate: { ideal: 24, max: 30 } },
+                audio: {
+                    suppressLocalAudioPlayback: true,
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false
+                },
+                systemAudio: 'exclude',
+                selfBrowserSurface: 'exclude',
+                surfaceSwitching: 'include'
+            });
+        } catch (e) {
+            console.warn('[mtm] getDisplayMedia dibatalkan/tidak diizinkan', e);
+            toast('Share screen dibatalkan');
+            return;
+        }
+        if (!stream.getVideoTracks()[0]) { toast('Tidak ada video dari pilihan layar'); try { stream.getTracks().forEach(t => t.stop()); } catch (_) {} return; }
+        S.screenStream = stream;
+        S.screenActive = true;
+        const a = stream.getAudioTracks()[0];
+        if (a) hintMusic(a);
+        // Preview untuk DJ (muted — DJ dengar audio asli dari speaker sendiri)
+        const v = $('#screen-video');
+        if (v) { v.srcObject = stream; }
+        const panel = $('#screen-panel'); if (panel) panel.classList.remove('hidden');
+        $('#btn-stop-screen').hidden = false;
+        $('#btn-share-screen').classList.add('active');
+        // Hentikan saat user stop lewat UI browser
+        const vt = stream.getVideoTracks()[0];
+        if (vt) vt.onended = () => { if (S.screenActive) stopScreenShare(); };
+        pub({ type: 'screen', active: true });
+        console.log('[mtm] screen share ON, audio=', !!a);
+        toast(a ? '🖥️ Layar + audio sistem sedang dibagikan' : '🖥️ Layar dibagikan (audio tetap dari player)');
+        // Guest harus re-konek untuk dapat layout baru
+        bounceAllGuests();
+    }
+    function stopScreenShare() {
+        if (S.screenStream) { try { S.screenStream.getTracks().forEach(t => t.stop()); } catch (_) {} S.screenStream = null; }
+        S.screenActive = false;
+        hideScreenUi();
+        pub({ type: 'screen', active: false });
+        console.log('[mtm] screen share OFF');
+        toast('🖥️ Share screen dihentikan');
+        bounceAllGuests();
+    }
+    function toggleScreenShare() {
+        if (S.screenActive) stopScreenShare();
+        else startScreenShare();
+    }
+    function hideScreenUi() {
+        const v = $('#screen-video'); if (v) v.srcObject = null;
+        const panel = $('#screen-panel'); if (panel) panel.classList.add('hidden');
+        const stop = $('#btn-stop-screen'); if (stop) stop.hidden = true;
+        const btn = $('#btn-share-screen'); if (btn) btn.classList.remove('active');
     }
     function closeGuestPc() {
         if (S.pc) { try { S.pc.close(); } catch (_) {} S.pc = null; }
@@ -287,6 +437,21 @@
 
             // Broadcast state periodik (refresh utk yg telat gabung / resync)
             S.pubT = setInterval(() => { pubState(); }, 5000);
+
+            // Pemantau capture DJ: DJ dengar = capture keluar? (RMS live stream)
+            let rmsSilent = 0;
+            S.rmsT = setInterval(() => {
+                if (!S.isDJ || !S.audio || S.audio.paused) { rmsSilent = 0; return; }
+                S.djRms = djRms();
+                if (S.djRms < 0.001) {
+                    if (++rmsSilent >= 3 && S.queue.length) {
+                        console.warn('[mtm] CAPTURE SENYAP meski element diputar (rms=', S.djRms.toFixed(5), ')');
+                        S.rmsWarned = true;
+                        toast('⚠️ Host: audio peserta terputus — refresh halaman ini');
+                        rmsSilent = 0;
+                    }
+                } else { rmsSilent = 0; }
+            }, 1000);
         }, onDjMsg);
     }
 
@@ -306,6 +471,13 @@
             case 'ice':
                 addIce(d.id, d.candidate);
                 break;
+            case 'answer': {
+                const pc = S.pcs.get(d.id);
+                if (pc && pc.signalingState !== 'stable') {
+                    pc.setRemoteDescription(d.sdp).catch((e) => console.error('dj setRemote err', e));
+                }
+                break;
+            }
             case 'beatG': {
                 const g = S.guests.get(d.id);
                 if (g) { g.lastSeen = Date.now(); }
@@ -336,6 +508,7 @@
             time: S.audio ? S.audio.currentTime : 0,
             dur: S.duration,
             dj: true,
+            screen: S.screenActive,
             guests: Array.from(S.guests).map(([id, g]) => ({ id, name: g.name })),
         });
     }
@@ -419,6 +592,13 @@
                 if (S.audio) { hideTapToHear(); tryAutoPlay(); setPlayBtn(true); } break;
             case 'pause': if (S.audio) { S.audio.pause(); hideTapToHear(); setPlayBtn(false); } break;
             case 'seek':  if (S.audio && !S.audio.srcObject && d.time != null) { S.audio.currentTime = d.time; } break;
+            case 'screen': {
+                if (!d.active) hideGuestScreen();
+                closeGuestPc();
+                S.gotStream = false;
+                setTimeout(() => guestOffer(), 900);
+                break;
+            }
             case 'syn': {
                 if (!S.audio) break;
                 const lat = (Date.now() - d.ts) / 1000;
@@ -435,6 +615,18 @@
             case 'answer':
                 if (S.pc && S.pc.localDescription && S.pc.signalingState !== 'stable') {
                     S.pc.setRemoteDescription(d.sdp).catch((e) => console.error('setRemote err', e));
+                }
+                break;
+            case 'reans':
+                if (S.pc && d.sdp) {
+                    S.pc.setRemoteDescription(d.sdp)
+                        .then(async () => {
+                            const ans = await S.pc.createAnswer();
+                            await S.pc.setLocalDescription(ans);
+                            pub({ type: 'answer', id: S.guestId, sdp: S.pc.localDescription });
+                            console.log('[mtm] chat renegosiasi selesai (DJ kirim ulang track)');
+                        })
+                        .catch((e) => console.error('reans err', e));
                 }
                 break;
             case 'ice':
@@ -553,11 +745,17 @@
         if (S.beatT) { clearInterval(S.beatT); S.beatT = null; }
         if (S.syncT) { clearInterval(S.syncT); S.syncT = null; }
         if (S.pubT)  { clearInterval(S.pubT);  S.pubT  = null; }
+        if (S.rmsT)  { clearInterval(S.rmsT);  S.rmsT  = null; }
+        S.djRms = 0;
         if (S.beatGT) { clearInterval(S.beatGT); S.beatGT = null; }
         if (S._stopGuestLoops) { S._stopGuestLoops(); S._stopGuestLoops = null; }
     }
     function destroyAll() {
         destroyBroker();
+        if (S.screenStream) { try { S.screenStream.getTracks().forEach(t => t.stop()); } catch (_) {} S.screenStream = null; }
+        S.screenActive = false;
+        hideScreenUi();
+        hideGuestScreen();
         S.pcs.forEach((pc, id) => closePc(id));
         S.guests.clear();
         if (S.pc) closeGuestPc();
@@ -570,6 +768,8 @@
         S.announced = false;
         S.others.clear();
         S.roomShown = false;
+        S.djRms = 0;
+        S.rmsWarned = false;
     }
 
     // ─── UI ────────────────────────────────────────────────
@@ -725,6 +925,8 @@
 
         $('#btn-shuffle').addEventListener('click', () => toast('Shuffle: segera'));
         $('#btn-repeat').addEventListener('click',  () => toast('Repeat: segera'));
+        $('#btn-share-screen').addEventListener('click', toggleScreenShare);
+        $('#btn-stop-screen').addEventListener('click', stopScreenShare);
 
         // Debug hook (untuk pengujian headless)
         window.__mtm = {
@@ -737,6 +939,12 @@
                     srcKind: S.audio.srcObject ? S.audio.srcObject.constructor.name : null,
                     tracks: S.audio.srcObject ? S.audio.srcObject.getTracks().map(t => t.kind) : [],
                     tapToHearHidden: !!$('#tap-to-hear').hidden,
+                    pcState: S.isDJ ? Array.from(S.pcs).map(([id, pc]) => id + '=' + pc.connectionState).join(',')
+                                    : (S.pc ? S.pc.connectionState : 'none'),
+                    djRms: S.djRms,
+                    queueLen: S.queue.length,
+                    screenActive: !!S.screenActive,
+                    screenStream: !!S.screenStream,
                 };
             },
             toast: (m) => toast(m),

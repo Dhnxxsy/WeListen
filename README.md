@@ -20,8 +20,9 @@ Pakai **WebRTC** (peer-to-peer): tidak ada server musik. Yang ada cuma **signali
 
 ## Fitur
 
-- **Kualitas jernih** — Opus 48kHz stereo (bukan kualitas telepon. ±128kbps, setara Spotify high)
+- **Kualitas tinggi (HD)** — Opus 48kHz **stereo penuh** 512kbps (SDP munging `maxaveragebitrate=512000;stereo=1`), ditambah `contentHint=music` pada track audio agar browser memprioritaskan kualitas audio
 - **Sinkron real-time** — semua pendengar dengar lagu yang sama dalam selisih ±100ms (uji: drift < 250ms selama 60 detik tanpa koreksi)
+- **Bagikan layar + audio** — DJ bisa **share screen** (mis. video YouTube/live streaming) lengkap dengan audio sistemnya (Chrome/Edge). Tanpa audio layar (Firefox/Safari), musik DJ jadi backup audio-nya. Pendengar melihat panel video + ikon LIVE.
 - **Tanpa VPS** — signaling MQTT publik gratis + hosting statis gratis
 - **Bisa dari HP** — buka link, langsung gabung, tanpa install
 - **DJ package** — upload dari HP/laptop, drag & drop, antrian, next/prev, seek, hapus lagu

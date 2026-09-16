@@ -59,6 +59,13 @@
     <div class="room-body">
         <!-- Left: Player -->
         <div class="player-panel">
+            <!-- Screen Share -->
+            <div id="screen-panel" class="screen-panel hidden">
+                <span class="screen-live"><span class="live-dot"></span> LIVE</span>
+                <video id="screen-video" autoplay muted playsinline></video>
+                <button id="btn-stop-screen" class="screen-stop" hidden>■ Stop</button>
+            </div>
+
             <!-- Now Playing Card -->
             <div class="now-playing">
                 <div class="album-art" id="album-art">
@@ -106,10 +113,11 @@
                     <div class="upload-content">
                         <span class="upload-icon">📎</span>
                         <span>Klik atau seret file musik ke sini</span>
-                        <span class="upload-hint">MP3, FLAC, WAV, OGG — maks 50MB per file</span>
-                    </div>
-                </label>
-            </div>
+<span class="upload-hint">MP3, FLAC, WAV, OGG — maks 50MB per file</span>
+                        </div>
+                    </label>
+                    <button id="btn-share-screen" class="btn btn-accent btn-share">🖥️ Share Screen</button>
+                </div>
 
             <!-- Queue -->
             <div class="panel-section">
