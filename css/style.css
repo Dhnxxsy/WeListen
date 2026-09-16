@@ -206,6 +206,22 @@ body {
     font-size: 12px;
 }
 
+.join-status {
+    min-height: 18px;
+    font-size: 12px;
+    margin-top: 8px;
+    transition: color var(--transition);
+}
+.join-status.connecting { color: var(--accent); }
+.join-status.retrying   { color: #ff9800; }
+.join-status.error      { color: var(--danger); }
+
+.btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
 /* ===================== ROOM ===================== */
 
 #room {

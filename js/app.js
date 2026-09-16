@@ -11,6 +11,21 @@
     const MAX_FILE_MB      = 50;
     const ROOM_PREFIX      = 'mt-';
     const CODE_CHARS       = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const JOIN_MAX_ATTEMPTS = 4;
+    const JOIN_TIMEOUT_MS   = 9000;
+    const JOIN_RETRY_BASE_MS= 1200;
+
+    // Multi-STUN: memperbesar peluang koneksi P2P tembus NAT.
+    const PEER_OPTS = {
+        debug: 0,
+        config: {
+            iceServers: [
+                { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+                { urls: 'stun:global.stun.twilio.com:3478' },
+                { urls: 'stun:stun.cloudflare.com:3478' },
+            ]
+        }
+    };
 
     // ─── STATE ─────────────────────────────────────────────
     const S = {
@@ -28,6 +43,10 @@
         listeners: new Map(),  // peerId → {name, color}
         syncTimer: null,
         duration: 0,
+        joinBusy:  false,      // joiner sedang mencoba koneksi
+        joinAttempt: 0,
+        joinTimer:   null,
+        syncReqCount: 0,  // jumlah permintaan ulang stream saat join
     };
 
     // ─── DOM HELPERS ──────────────────────────────────────
@@ -69,9 +88,23 @@
     }
 
     // ─── ROOM ──────────────────────────────────────────────
+    function setJoinStatus(msg, cls) {
+        const el = $('#join-status');
+        if (!el) return;
+        el.textContent = msg;
+        el.className = cls ? 'join-status ' + cls : 'join-status';
+    }
+
+    function destroyPeer() {
+        if (S.peer) { try { S.peer.destroy(); } catch (_) {} S.peer = null; }
+    }
+
     function createRoom() {
+        if (S.joinBusy) return;
+        setJoinStatus('');
+        destroyPeer();
         const code = genCode();
-        const peer = new Peer(ROOM_PREFIX + code, { debug: 0 });
+        const peer = new Peer(ROOM_PREFIX + code, PEER_OPTS);
 
         peer.on('open', () => {
             S.isDJ = true;
@@ -82,50 +115,140 @@
         });
 
         peer.on('connection', onIncomingConn);
-        peer.on('error', (err) => { console.error(err); toast('Error: ' + err.type); });
+        peer.on('error', (err) => {
+            console.error('DJ peer error:', err);
+            if (err.type === 'unavailable-id') {
+                peer.destroy();
+                setTimeout(createRoom, 200);
+                return;
+            }
+            toast('Error: ' + err.type);
+        });
+        peer.on('disconnected', () => {
+            toast('⚠ Sinyal terputus — mencoba reconnect…');
+        });
+        peer.on('reconnected', () => {
+            toast('Sinyal kembali normal.');
+        });
+        peer.on('close', () => {
+            toast('Koneksi ke server sinyal hilang');
+            goHome();
+        });
     }
 
+    // ── Listener join (with retry) ──────────────────────
     function joinRoom(code) {
-        const peer = new Peer(undefined, { debug: 0 });
+        if (S.joinBusy) return;
+        if (!code || code.length < 4) { toast('Masukkan kode ruangan yang valid'); return; }
+        destroyPeer();
+        S.joinBusy = true;
+        S.joinAttempt = 0;
+        setJoinStatus('Mencari ruangan…', 'connecting');
+        $('#btn-join').disabled = true;
+        $('#btn-create').disabled = true;
 
-        // Receive DJ's audio stream
-        peer.on('call', (call) => {
-            call.answer();
-            call.on('stream', (remoteStream) => {
-                S.audio.srcObject = remoteStream;
-                S.audio.play().catch(() => {});
+        function attempt() {
+            S.joinAttempt++;
+            const target = ROOM_PREFIX + code.toUpperCase();
+            const peer = new Peer(undefined, PEER_OPTS);
+
+            // Receive DJ's audio stream — set up BEFORE connect attempt
+            peer.on('call', (call) => {
+                call.answer();
+                call.on('stream', (remoteStream) => {
+                    S.syncReqCount = 0;
+                    S.audio.srcObject = remoteStream;
+                    S.audio.play().catch(() => {});
+                });
+                call.on('error', (e) => console.error('call err', e));
             });
-            call.on('error', (e) => console.error('call err', e));
-        });
 
-        peer.on('open', () => {
-            S.isDJ = false;
-            S.roomCode = code;
-            S.peer = peer;
+            peer.on('open', () => {
+                setJoinStatus('Bergabung… (percobaan ' + S.joinAttempt + ')', 'connecting');
+                const conn = peer.connect(target, { reliable: true });
 
-            const conn = peer.connect(ROOM_PREFIX + code, { reliable: true });
+                const timer = setTimeout(() => {
+                    // Timed out — destroy and retry
+                    try { conn.close(); } catch (_) {}
+                    peer.destroy();
+                    retry();
+                }, JOIN_TIMEOUT_MS);
 
-            conn.on('open', () => {
-                S.conns.push(conn);
-                showRoom();
-                toast('Berhasil gabung!');
+                conn.on('open', () => {
+                    clearTimeout(timer);
+                    S.isDJ = false;
+                    S.roomCode = code.toUpperCase();
+                    S.peer = peer;
+                    S.conns = [conn];
+                    S.joinBusy = false;
+                    $('#btn-join').disabled = false;
+                    $('#btn-create').disabled = false;
+                    setJoinStatus('');
+                    showRoom();
+                    toast('Berhasil gabung!');
+                });
+
+                conn.on('data', (d) => handleMsg(d, conn));
+                conn.on('close', () => {
+                    clearTimeout(timer);
+                    toast('Koneksi terputus — sedang reconnect…');
+                    S.joinBusy = true;
+                    S.joinAttempt = 0;
+                    peer.destroy();
+                    retry();
+                });
+                conn.on('error', (e) => {
+                    clearTimeout(timer);
+                    console.error('conn error', e);
+                    S.joinBusy = true;
+                    S.joinAttempt = 0;
+                    peer.destroy();
+                    retry();
+                });
             });
 
-            conn.on('data', (d) => handleMsg(d, conn));
-            conn.on('close', () => { toast('Terputus'); goHome(); });
-            conn.on('error', (e) => { console.error(e); toast('Koneksi error'); });
-        });
+            peer.on('error', (err) => {
+                console.error('join peer error:', err.type);
+                peer.destroy();
+                if (err.type === 'peer-unavailable') {
+                    // Room truly not found — don't retry forever
+                    if (S.joinAttempt >= 2) {
+                        finishJoin('Ruangan tidak ditemukan. Pastikan DJ masih buka halaman.', 'error');
+                        return;
+                    }
+                }
+                retry();
+            });
+        }
 
-        peer.on('error', (err) => {
-            console.error(err);
-            if (err.type === 'peer-unavailable') toast('Ruangan tidak ditemukan');
-            else toast('Error: ' + err.type);
-        });
+        function retry() {
+            if (S.joinAttempt >= JOIN_MAX_ATTEMPTS || !S.joinBusy) {
+                finishJoin(S.joinBusy ? 'Gagal terhubung.' : '', 'error');
+                return;
+            }
+            const delay = JOIN_RETRY_BASE_MS * S.joinAttempt;
+            setJoinStatus('Mencoba ulang dalam ' + Math.round(delay / 1000) + 's…', 'retrying');
+            S.joinTimer = setTimeout(attempt, delay);
+        }
+
+        function finishJoin(msg, cls) {
+            S.joinBusy = false;
+            $('#btn-join').disabled = false;
+            $('#btn-create').disabled = false;
+            setJoinStatus(msg, cls);
+            if (msg) toast(msg);
+            // If we were in room (reconnecting), go back home on final failure
+            if (cls === 'error' && $('#room').classList.contains('active')) goHome();
+        }
+
+        attempt();
     }
 
     function leaveRoom() {
         if (S.syncTimer) { clearInterval(S.syncTimer); S.syncTimer = null; }
-        if (S.peer) { try { S.peer.destroy(); } catch (_) {} }
+        if (S.joinTimer) { clearTimeout(S.joinTimer); S.joinTimer = null; }
+        S.joinBusy = false;
+        destroyPeer();
         S.conns = [];
         S.listeners.clear();
         S.queue.forEach(s => { if (s.url) URL.revokeObjectURL(s.url); });
@@ -202,9 +325,10 @@
                 if (S.songIdx >= 0 && S.queue[S.songIdx]) updateTrack(S.queue[S.songIdx].name);
 
                 // Robustness: request audio stream if none arrived shortly after joining
-                if (d.songIdx >= 0) {
+                if (d.songIdx >= 0 && S.syncReqCount < 3) {
+                    S.syncReqCount++;
                     setTimeout(() => {
-                        if (!S.audio.srcObject && S.peer.connected) {
+                        if (!S.audio.srcObject && S.peer && S.peer.connected) {
                             try { S.conns.forEach(c => c.send({ type: 'request-sync' })); } catch (_) {}
                         }
                     }, 2500);
@@ -234,7 +358,7 @@
             case 'pause': { if (!S.isDJ && S.audio) { S.audio.pause();                  setPlayBtn(false); } break; }
 
             case 'seek': {
-                if (!S.isDJ && S.audio && d.time != null) {
+                if (!S.isDJ && S.audio && d.time != null && !S.audio.srcObject) {
                     S.audio.currentTime = d.time;
                     updateProgress(d.time, S.audio.duration || 0);
                 }
@@ -418,6 +542,7 @@
             $(sel).style.cursor = locked ? 'default' : 'pointer';
         });
         $('#progress-bar').style.cursor = locked ? 'default' : 'pointer';
+        if (S.isDJ) startSync();
         updateQueue();
         updateListeners();
     }
@@ -436,6 +561,9 @@
         $('#time-current').textContent = '0:00';
         $('#time-duration').textContent = '0:00';
         setPlayBtn(false);
+        const el = $('#join-status'); if (el) el.textContent = '';
+        $('#btn-join').disabled = false;
+        $('#btn-create').disabled = false;
     }
 
     function updateTrack(name) {

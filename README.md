@@ -30,11 +30,16 @@ Bisa-nya pake **WebRTC** (peer-to-peer): tidak ada server musik. Yang ada cuma s
 ## Cara Pakai
 
 **Cara paling cepat (uji lokal):**
-1. Buka dua browser (atau dua device)
-2. Buka `index.html`
-3. Browser 1 → klik **Buat Ruangan** → dapat kode 6 huruf
-4. Browser 2 → masukkan kode → **Gabung**
-5. Di Browser 1, upload lagu → play → Browser 2 ikut terdengar
+1. Aktifkan server lokal di folder ini:
+   ```
+   python -m http.server 8000
+   ```
+2. Buka `http://localhost:8000` di **dua tab browser** (atau 2 device)
+3. Tab 1 → klik **Buat Ruangan** → dapat kode 6 huruf
+4. Tab 2 → masukkan kode → **Gabung**
+5. Di Tab 1, upload lagu → play → Tab 2 ikut terdengar sinkron
+
+> Kalau pakai `file://` (double-click) juga bisa, tapi server lokal lebih baik.
 
 **Cara jalan di internet (gratis, GitHub Pages):**
 
@@ -67,6 +72,13 @@ music-together/
 
 - **PeerJS CDN** — signaling server gratis (`0.peerjs.com`), VPS 0.
 - **Media element → `createMediaElementSource()`** → `MediaStreamDestination` → dikirim via `peer.call()`.
+
+## Ketahanan
+
+- **Retry otomatis saat join** — jika discovery gagal (umum di server sinyal gratis), pendengar mengulang hingga 4x dengan jeda bertambah → tidak akan "terputus" di tengah pencarian.
+- **Multi-STUN** — 3 server STUN (Google ×2, Twilio, Cloudflare) memaksimalkan peluang koneksi P2P tembus NAT.
+- **Reconnect** — kalau koneksi putus, pendengar otomatis nyambung lagi ke ruangan yang sama.
+- **Kode unik** — collision kode ruangan dideteksi & kode baru dibuat otomatis.
 
 ## Limitasi (v1)
 
