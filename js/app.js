@@ -21,6 +21,7 @@
     const CODE_CHARS       = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
     const RTC_OPTS = {
+        iceCandidatePoolSize: 4,
         iceServers: [
             { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
             { urls: 'stun:global.stun.twilio.com:3478' },
@@ -54,6 +55,7 @@
         others:   new Map(),  // guest-side roster (id → name), exclude self
         pc:       null,
         gotStream:false,
+        gotVideo: false,
         announced:false,
         djAlive:  0,            // last time DJ seen (ms)
         beatGT:   null,
@@ -248,9 +250,12 @@
             if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
                 closePc(guestId);
             }
+            connMon();
         };
         try {
             await pc.setRemoteDescription(offerSdp);
+            (pc._pending || []).forEach(c => { try { pc.addIceCandidate(c); } catch (_) {} });
+            pc._pending = [];
             const ans = mungeHdSdp((await pc.createAnswer()).sdp);
             await pc.setLocalDescription({ type: 'answer', sdp: ans });
             pub({ type: 'answer', to: guestId, sdp: pc.localDescription });
@@ -269,18 +274,44 @@
     }
     function addIce(guestId, cand) {
         const pc = S.pcs.get(guestId);
-        if (pc && cand) { try { pc.addIceCandidate(cand); } catch (e) {} }
+        if (!pc || !cand) return;
+        if (pc.remoteDescription) { try { pc.addIceCandidate(cand); } catch (_) {} }
+        else { (pc._pending = pc._pending || []).push(cand); }   // buffer kandidat dini (Firefox)
+    }
+    function setConn(msg, cls) {
+        const el = $('#conn-status');
+        if (!el) return;
+        el.textContent = msg || '—';
+        el.className = 'conn-status' + (cls ? ' ' + cls : '');
+    }
+    function connMon() {
+        if (S.isDJ) {
+            const total = S.pcs.size;
+            const ok = Array.from(S.pcs.values()).filter(p => p.connectionState === 'connected').length;
+            if (!total) setConn('Menunggu pendengar…');
+            else setConn(ok === total ? '👥 ' + total + ' terhubung' : '⏳ ' + ok + '/' + total + ' terhubung', ok === total ? 'ok' : 'warn');
+        } else {
+            const st = S.pc ? S.pc.connectionState : 'new';
+            switch (st) {
+                case 'connected': setConn('🔊 Terhubung ke DJ', 'ok'); break;
+                case 'failed':    setConn('⚠️ Koneksi gagal — mencoba ulang…', 'bad'); break;
+                case 'closed':    setConn('Koneksi ditutup', 'warn'); break;
+                default:          setConn('Menghubungkan…'); break;
+            }
+        }
     }
 
     // Guest side: recvonly audio+video, trickle ICE, apply answer
     async function guestOffer() {
         if (S.isDJ || S.pc) return;
+        setConn('Menghubungkan…');
         const pc = new RTCPeerConnection(RTC_OPTS);
         pc.addTransceiver('audio', { direction: 'recvonly' });
         pc.addTransceiver('video', { direction: 'recvonly' });
         pc.onicecandidate = (e) => { if (e.candidate) pub({ type: 'ice', id: S.guestId, candidate: e.candidate }); };
         pc.ontrack = (ev) => {
             if (ev.track.kind === 'video') {
+                S.gotVideo = true;
                 const v = $('#screen-video');
                 if (v) v.srcObject = new MediaStream([ev.track]);
                 const p = $('#screen-panel'); if (p) p.classList.remove('hidden');
@@ -288,6 +319,7 @@
                 return;
             }
             S.gotStream = true;
+            if (pc._watch) { clearTimeout(pc._watch); pc._watch = null; }
             S.audio.srcObject = new MediaStream([ev.track]);
             S.audio.muted = false;
             hideTapToHear();
@@ -295,11 +327,13 @@
             tryAutoPlay();
         };
         pc.onconnectionstatechange = () => {
+            connMon();
             if (pc.connectionState === 'connected') {
                 setJoinStatus('');
                 if (!S.announced) { S.announced = true; toast('Berhasil gabung!'); }
             }
             if (pc.connectionState === 'failed') {
+                if (pc._watch) { clearTimeout(pc._watch); pc._watch = null; }
                 closeGuestPc();
                 S.gotStream = false;
                 toast('Koneksi audio bermasalah — mencoba ulang…');
@@ -314,6 +348,14 @@
             console.error('guestOffer error', e);
             closeGuestPc();
         }
+        // Watchdog: connected tapi belum ada track → coba ulang sekali
+        pc._watch = setTimeout(() => {
+            if (pc.connectionState === 'connected' && !S.gotStream && !S.gotVideo) {
+                console.warn('[mtm] connected tanpa media — re-offer ulang');
+                closeGuestPc();
+                guestOffer();
+            }
+        }, 6000);
     }
     function hideGuestScreen() {
         const v = $('#screen-video'); if (v) v.srcObject = null;
@@ -386,17 +428,24 @@
         const btn = $('#btn-share-screen'); if (btn) btn.classList.remove('active');
     }
     function closeGuestPc() {
-        if (S.pc) { try { S.pc.close(); } catch (_) {} S.pc = null; }
+        if (S.pc) {
+            if (S.pc._watch) { clearTimeout(S.pc._watch); S.pc._watch = null; }
+            try { S.pc.close(); } catch (_) {}
+            S.pc = null;
+        }
         S.gotStream = false;
+        S.gotVideo = false;
     }
     // Autoplay bisa diblokir Chrome (tanpa gesture) → tampilkan tombol sekali klik
     function tryAutoPlay() {
+        if (!S.audio) return;
         const p = S.audio.play();
         if (p && p.catch) {
-            p.catch((e) => {
+            p.then(() => { if (!S.audio.paused) hideTapToHear(); }).catch((e) => {
                 console.warn('[mtm] autoplay terblokir:', e && e.name);
                 const btn = $('#tap-to-hear');
                 if (btn) btn.hidden = false;
+                toast('🔊 Ketuk tombol untuk mendengar audio');
             });
         }
     }
@@ -613,11 +662,15 @@
                 break;
             }
             case 'answer':
-                if (S.pc && S.pc.localDescription && S.pc.signalingState !== 'stable') {
-                    S.pc.setRemoteDescription(d.sdp).catch((e) => console.error('setRemote err', e));
+                if (d.to !== S.guestId) break;   // jawaban untuk guest lain
+                if (S.pc && S.pc.localDescription && S.pc.signalingState === 'have-local-offer') {
+                    S.pc.setRemoteDescription(d.sdp)
+                        .then(() => { (S.pc._pending || []).forEach(c => { try { S.pc.addIceCandidate(c); } catch (_) {} }); S.pc._pending = []; })
+                        .catch((e) => { console.error('setRemote err', e); closeGuestPc(); S.gotStream = false; setTimeout(() => guestOffer(), 700); });
                 }
                 break;
             case 'reans':
+                if (d.to !== S.guestId) break;
                 if (S.pc && d.sdp) {
                     S.pc.setRemoteDescription(d.sdp)
                         .then(async () => {
@@ -630,7 +683,11 @@
                 }
                 break;
             case 'ice':
-                if (S.pc && d.candidate) { try { S.pc.addIceCandidate(d.candidate); } catch (e) {} }
+                if (d.to !== S.guestId) break;
+                if (S.pc && d.candidate) {
+                    if (S.pc.remoteDescription) { try { S.pc.addIceCandidate(d.candidate); } catch (_) {} }
+                    else { (S.pc._pending = S.pc._pending || []).push(d.candidate); }
+                }
                 break;
             case 'j':
                 if (d.id !== S.guestId) S.others.set(d.id, d.name);
@@ -765,6 +822,7 @@
         S.playing = false;
         S.duration = 0;
         S.gotStream = false;
+        S.gotVideo = false;
         S.announced = false;
         S.others.clear();
         S.roomShown = false;
@@ -790,6 +848,7 @@
         });
         $('#progress-bar').style.cursor = locked ? 'default' : 'pointer';
         if (S.isDJ) startSync();
+        connMon();
         updateQueue();
         updateListenersL();
     }
@@ -797,6 +856,7 @@
         $('#home').classList.add('active');
         $('#room').classList.remove('active');
         $('#dj-controls').classList.add('hidden');
+        setConn('');
         $('#queue-list').innerHTML = '<li class="queue-empty">Belum ada lagu</li>';
         $('#listener-list').innerHTML = '';
         $('#track-title').textContent = 'Belum ada lagu';
@@ -922,6 +982,13 @@
             tryAutoPlay();
             setTimeout(() => { if (!S.audio.paused) hideTapToHear(); }, 600);
         });
+        // Gestur pertama di mana saja membebaskan autoplay (browser asli mblokir tanpa interaksi)
+        const unblockOnce = () => {
+            try { if (S.audio && S.audio.srcObject) S.audio.play().catch(() => {}); } catch (_) {}
+            if (S.audio && !S.audio.paused) hideTapToHear();
+            document.removeEventListener('pointerdown', unblockOnce);
+        };
+        document.addEventListener('pointerdown', unblockOnce);
 
         $('#btn-shuffle').addEventListener('click', () => toast('Shuffle: segera'));
         $('#btn-repeat').addEventListener('click',  () => toast('Repeat: segera'));
@@ -945,6 +1012,7 @@
                     queueLen: S.queue.length,
                     screenActive: !!S.screenActive,
                     screenStream: !!S.screenStream,
+                    gotVideo: S.gotVideo,
                 };
             },
             toast: (m) => toast(m),

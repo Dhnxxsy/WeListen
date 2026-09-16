@@ -86,8 +86,18 @@ music-together/
 
 - File audio: maks 50MB per lagu, dari device DJ.
 - DJ harus online — kalau DJ keluar, ruangan bubar.
-- Kualitas = kompresi WebRTC Opus (masih jauh lebih bagus dari voice chat; FLAC asli tidak didukung live-stream).
-- **NAT simetris** (sering di jaringan seluler) tidak bisa ditembus P2P murni — butuh TURN relay. TURN publik jarang andal, jadi kalau gagal "koneksi audio bermasalah — mencoba ulang", coba ganti ke jaringan lain (wifi) atau buat TURN sendiri di rumah/NAS.
+- Kualitas = kompresi WebRTC Opus (HD 512kbps stereo via SDP munging — setara Spotify).
+- **NAT simetris** (sering di jaringan seluler) tidak bisa ditembus P2P murni — butuh TURN relay. Kalau gagal, pastikan DJ dan pendengar di **Wi-Fi yang sama**.
+
+## Troubleshooting
+
+**Klik tombol "🔊 Klik untuk mendengar"** — browser memblokir autoplay musik tanpa interaksi pertama dari user. Tap sekali pada tombol (atau ketuk mana saja di layar), audio langsung jalan.
+
+**Pendengar tidak dapat audio?** — Buka console browser pendengar (F12), ketik `JSON.stringify(window.__mtm.state,null,2)`. Cek:
+- `pcState: "connected"` → WebRTC OK → masalah autoplay (lihat di atas).
+- `pcState: "failed"` → WebRTC gagal. Solusi: DJ dan pendengar harus di **jaringan yang sama** (satu WiFi/LAN) atau gunakan jaringan rumah yang bukan seluler.
+- `srcObject: true, tracks: ["audio"]` → stream sudah sampai, kembali ke langkah autoplay.
+- `gotStream: false` → stream belum sampai, tunggu atau cek jaringan.
 
 ## Roadmap
 
