@@ -166,9 +166,15 @@
     // DJ side: answer guest's recvonly offer, attach djTrack
     async function answerGuest(guestId, offerSdp) {
         closePc(guestId);
+        if (!S.djTrack) ensureStream();
         const pc = new RTCPeerConnection(RTC_OPTS);
         S.pcs.set(guestId, pc);
-        if (S.djTrack) pc.addTrack(S.djTrack, S.djStream);
+        if (S.djTrack) {
+            pc.addTrack(S.djTrack, S.djStream);
+            console.log('[mtm] DJ attach track ke guest', guestId);
+        } else {
+            console.warn('[mtm] DJ belum punya track saat answer guest', guestId);
+        }
         pc.onicecandidate = (e) => { if (e.candidate) pub({ type: 'ice', to: guestId, candidate: e.candidate }); };
         pc.onconnectionstatechange = () => {
             if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
@@ -203,7 +209,10 @@
         pc.ontrack = (ev) => {
             S.gotStream = true;
             S.audio.srcObject = ev.streams[0] || ev.stream;
-            S.audio.play().catch(() => {});
+            S.audio.muted = false;
+            hideTapToHear();
+            console.log('[mtm] guest terima track audio, peerState=', pc.connectionState);
+            tryAutoPlay();
         };
         pc.onconnectionstatechange = () => {
             if (pc.connectionState === 'connected') {
@@ -230,6 +239,18 @@
         if (S.pc) { try { S.pc.close(); } catch (_) {} S.pc = null; }
         S.gotStream = false;
     }
+    // Autoplay bisa diblokir Chrome (tanpa gesture) → tampilkan tombol sekali klik
+    function tryAutoPlay() {
+        const p = S.audio.play();
+        if (p && p.catch) {
+            p.catch((e) => {
+                console.warn('[mtm] autoplay terblokir:', e && e.name);
+                const btn = $('#tap-to-hear');
+                if (btn) btn.hidden = false;
+            });
+        }
+    }
+    function hideTapToHear() { const b = $('#tap-to-hear'); if (b) b.hidden = true; }
 
     // ─── ROOM — DJ ─────────────────────────────────────────
     function createRoom() {
@@ -394,8 +415,9 @@
             case 'qrm':
                 if (S.queue[d.idx]) { S.queue.splice(d.idx, 1); if (d.idx <= S.songIdx) S.songIdx--; updateQueue(); }
                 break;
-            case 'play':  if (S.audio) { S.audio.play().catch(() => {}); setPlayBtn(true); } break;
-            case 'pause': if (S.audio) { S.audio.pause(); setPlayBtn(false); } break;
+            case 'play':
+                if (S.audio) { hideTapToHear(); tryAutoPlay(); setPlayBtn(true); } break;
+            case 'pause': if (S.audio) { S.audio.pause(); hideTapToHear(); setPlayBtn(false); } break;
             case 'seek':  if (S.audio && !S.audio.srcObject && d.time != null) { S.audio.currentTime = d.time; } break;
             case 'syn': {
                 if (!S.audio) break;
@@ -404,8 +426,8 @@
                 if (!S.audio.srcObject && Math.abs(S.audio.currentTime - target) > 0.25) {
                     S.audio.currentTime = target;
                 }
-                if (d.playing && S.audio.paused) S.audio.play().catch(() => {});
-                if (!d.playing && !S.audio.paused) S.audio.pause();
+                if (d.playing && S.audio.paused) tryAutoPlay();
+                if (!d.playing && !S.audio.paused) { S.audio.pause(); hideTapToHear(); }
                 setPlayBtn(d.playing);
                 if (S.duration && isFinite(S.duration)) updateProgress(target, S.duration);
                 break;
@@ -433,6 +455,7 @@
     function togglePlay() {
         if (!S.isDJ || !S.audio) return;
         ensureStream();
+        try { if (S.djCtx && S.djCtx.state === 'suspended') S.djCtx.resume(); } catch (_) {}
         if (S.audio.paused) {
             S.audio.play().catch(() => {});
             S.playing = true;
@@ -450,6 +473,7 @@
         const song = S.queue[idx];
         if (!song.url) return;
         ensureStream();
+        try { if (S.djCtx && S.djCtx.state === 'suspended') S.djCtx.resume(); } catch (_) {}
         S.songIdx = idx;
         S.audio.src = song.url;
         S.audio.play().catch(() => {});
@@ -693,7 +717,29 @@
 
         $('#volume-slider').addEventListener('input', (e) => { S.audio.volume = e.target.value / 100; });
 
+        const tapBtn = $('#tap-to-hear');
+        tapBtn.addEventListener('click', () => {
+            tryAutoPlay();
+            setTimeout(() => { if (!S.audio.paused) hideTapToHear(); }, 600);
+        });
+
         $('#btn-shuffle').addEventListener('click', () => toast('Shuffle: segera'));
         $('#btn-repeat').addEventListener('click',  () => toast('Repeat: segera'));
+
+        // Debug hook (untuk pengujian headless)
+        window.__mtm = {
+            get state() {
+                return {
+                    isDJ: S.isDJ, roomCode: S.roomCode, playing: S.playing,
+                    songIdx: S.songIdx, duration: S.duration, gotStream: S.gotStream,
+                    audioTime: S.audio.currentTime, audioPaused: S.audio.paused,
+                    audioEnded: S.audio.ended, srcObject: !!S.audio.srcObject,
+                    srcKind: S.audio.srcObject ? S.audio.srcObject.constructor.name : null,
+                    tracks: S.audio.srcObject ? S.audio.srcObject.getTracks().map(t => t.kind) : [],
+                    tapToHearHidden: !!$('#tap-to-hear').hidden,
+                };
+            },
+            toast: (m) => toast(m),
+        };
     });
 })();

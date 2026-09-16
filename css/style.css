@@ -693,6 +693,28 @@ body {
     to   { opacity: 0; transform: translateY(-12px); }
 }
 
+/* ===================== TAP TO HEAR ===================== */
+
+#tap-to-hear {
+    position: fixed;
+    bottom: 90px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 150;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    padding: 14px 28px;
+    font-size: 15px;
+    font-weight: 700;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+    animation: toastIn 0.3s ease forwards;
+    cursor: pointer;
+    pointer-events: auto;
+}
+#tap-to-hear[hidden] { display: none; }
+
 /* ===================== SCROLLBAR ===================== */
 
 ::-webkit-scrollbar { width: 6px; }
